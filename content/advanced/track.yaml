@@ -1,0 +1,2561 @@
+id: advanced
+title: Advanced
+description: >-
+  The parts of Docker that decide whether an image is safe to run in
+  production: who runs it, how it knows it is ready, where its credentials
+  come from, how its build is cached, whether it can be rebuilt identically,
+  and what it is allowed to do to the machine it lands on.
+difficulty: advanced
+order: 3
+lessons:
+  - id: a-users-and-permissions
+    title: Users and permissions
+    summary: Who runs the process inside the container, and what that user can actually do.
+    body: |
+      # Users and permissions
+
+      A container runs a process. The question that decides what that process
+      can do is *which user it runs as*, and the answer is usually "root",
+      which is almost never what anyone meant.
+
+      ## Root inside a container
+
+      `docker run` starts the container's process as uid 0 by default. Inside
+      the container that user is root, and it is as powerful as root
+      anywhere: it can write to every file in the container's filesystem.
+
+      What it is **not** is the host's root, and the difference is worth
+      being precise about:
+
+      - The container has its own **mount namespace**. The `/etc/passwd` it
+        reads is the image's, not the host's.
+      - The container has its own **pid namespace**. The process it calls
+        pid 1 is some other number on the host.
+      - The container has its own **network namespace** unless you share
+        one.
+      - The container's capabilities are a *subset* of what a host root has.
+        By default Docker grants fourteen of them: `CHOWN`,
+        `DAC_OVERRIDE`, `FOWNER`, `FSETID`, `KILL`, `SETGID`, `SETUID`,
+        `SETPCAP`, `NET_BIND_SERVICE`, `NET_RAW`, `SYS_CHROOT`, `MKNOD`,
+        `AUDIT_WRITE` and `SETFCAP`. The container cannot mount filesystems,
+        cannot reconfigure the host's network, and cannot load kernel
+        modules.
+
+      > **Callout**
+      > "Root in a container" is a statement about a uid, not about
+      > permissions. The uid is 0; the capabilities behind it are not the
+      > host's.
+
+      Namespaces are what produce the isolation. Capabilities are what
+      decide what the container's root may actually *do*. Both matter, and
+      they are separate dials.
+
+      ## Running as somebody else
+
+      The `USER` instruction sets the user the container's process runs as:
+
+      ```dockerfile
+      USER app
+      ```
+
+      It accepts a name, a uid, or `uid:gid`. It applies to `RUN`
+      instructions too, so a `RUN` after a `USER` cannot write to a
+      root-owned directory.
+
+      Three rules that matter in practice:
+
+      1. **Create the user first.** `USER app` fails at run time if the
+         image has no `app` entry. Docker does not create users for you.
+      2. **Fix the uid as well as the name.** `USER app` is fine until the
+         base image adds a user and shifts the uid underneath you.
+         `USER 1000:1000` survives that.
+      3. **Fix the ownership of what the process needs.** A non-root process
+         cannot write to a root-owned directory, and cannot read a `0600`
+         file owned by root.
+
+      ```dockerfile
+      FROM alpine:3.20
+
+      RUN adduser -D -u 1000 app
+      WORKDIR /app
+      COPY --chown=app:app app.txt /app/app.txt
+      RUN mkdir -p /data && chown app:app /data
+
+      USER app
+      ```
+
+      `COPY --chown` sets the ownership as the file is added, so there is no
+      moment at which the file exists owned by root.
+
+      ## Why bother
+
+      The point is not tidiness. A process running as uid 0 inside a
+      container that gets compromised has exactly the capabilities the
+      container was given, and the default set is larger than most
+      applications need. An application that reads its configuration and
+      writes to one directory needs almost none of it.
+
+      Dropping to a non-root user is also what makes the hardening in the
+      last lesson possible at all: a read-only root filesystem and a dropped
+      capability set only mean something once the process is not root.
+
+      > **Callout**
+      > Root in a container is not the same as root on the host, but it is
+      > not nothing either. The isolation is provided by namespaces you did
+      > not configure; the authority is provided by capabilities you can.
+    exercises:
+      - id: a-run-as-non-root
+        title: Run the image as a non-root user
+        prompt: |
+          Write a Dockerfile based on `alpine:3.20` that runs as a non-root
+          user.
+
+          Create a user called `app` with uid 1000, and make it the image's
+          default user with the `USER` instruction. When the image is run
+          with no arguments it must print the name of the user it is running
+          as.
+
+          The grader runs the image as it is, so the name has to come from
+          the image's own `CMD`.
+        kind: image
+        entry_file: Dockerfile
+        files:
+          Dockerfile: |
+            # Your Dockerfile here.
+            FROM alpine:3.20
+
+            # Create the user, then set USER.
+        solution:
+          Dockerfile: |
+            FROM alpine:3.20
+
+            RUN adduser -D -u 1000 app
+
+            USER app
+
+            CMD ["id", "-un"]
+        checks:
+          - name: the image prints the user it runs as
+            kind: default
+          - name: the process is not root
+            kind: run
+            command: test "$(id -u)" != "0" && echo "not root"
+          - name: the process runs as uid 1000
+            kind: run
+            command: id -u
+        cases:
+          - name: the default run
+        hints:
+          - "Alpine's BusyBox has `adduser`: `adduser -D -u 1000 app` creates the user without a password or a home directory."
+          - "The `USER` instruction takes the user name: `USER app`."
+          - "`id -un` prints the user name and `id -u` prints the uid, so `CMD [\"id\", \"-un\"]` prints `app`."
+        teach: |
+          `USER` sets the identity every later instruction and the running
+          container use. It is a metadata change to the image configuration,
+          not a runtime flag, so it applies to `docker run`, to compose, and
+          to Kubernetes alike.
+
+          The order in the Dockerfile matters. `USER` before `RUN` means the
+          `RUN` executes as that user, which is why the user has to exist
+          before it is named -- `adduser` writes to `/etc/passwd`, and a
+          non-root process cannot do that.
+
+          `adduser -D -u 1000 app` creates the user with a fixed uid and no
+          password. Fixing the uid is what makes the image portable: a
+          numeric `USER 1000:1000` means the same thing whatever the base
+          image does to its own user list.
+
+          The checks look at behaviour rather than at the spelling of the
+          instruction. `USER app`, `USER 1000` and `USER app:app` all
+          produce uid 1000; only the first two print the name `app`, which
+          is what the image's own command asks for.
+        tags: [dockerfile, security, config]
+      - id: a-owned-files
+        title: Give the application files to the application user
+        prompt: |
+          The image below copies `app.txt` into `/app` and then drops to a
+          non-root user. The file is still owned by root, so the process
+          cannot modify it.
+
+          Fix the ownership so that the file belongs to the `app` user, and
+          make sure the running process can write to it. The image must
+          still print the uid and gid of `/app/app.txt` when it runs.
+        kind: image
+        entry_file: Dockerfile
+        files:
+          "app.txt": |
+            the application payload
+          Dockerfile: |
+            FROM alpine:3.20
+
+            RUN adduser -D -u 1000 app
+
+            WORKDIR /app
+
+            COPY app.txt /app/app.txt
+
+            USER app
+
+            CMD ["stat", "-c", "%u %g", "/app/app.txt"]
+        solution:
+          "app.txt": |
+            the application payload
+          Dockerfile: |
+            FROM alpine:3.20
+
+            RUN adduser -D -u 1000 app
+
+            WORKDIR /app
+
+            COPY --chown=app:app app.txt /app/app.txt
+
+            USER app
+
+            CMD ["stat", "-c", "%u %g", "/app/app.txt"]
+        checks:
+          - name: the image prints the file's owner
+            kind: default
+          - name: the file belongs to the app user
+            kind: run
+            command: stat -c '%U' /app/app.txt
+          - name: the process can write to the file
+            kind: run
+            command: test -w /app/app.txt && echo writable
+        cases:
+          - name: the default run
+        hints:
+          - "`COPY` has a `--chown` option that sets the ownership as the file is added: `COPY --chown=app:app app.txt /app/app.txt`."
+          - "The alternative is to create the file with a `RUN` and then `chown` it, but then the file is briefly owned by root."
+          - "A file owned by root with mode 644 can be read by anybody but written only by root."
+        teach: |
+          Ownership is not decoration. The kernel decides who may read and
+          who may write based on the file's uid and gid and its mode bits,
+          and a process running as uid 1000 cannot write to a file owned by
+          uid 0.
+
+          `COPY --chown=app:app` sets the ownership during the copy, so the
+          file is never on disk owned by root. The alternative -- copying
+          first and `chown`ing in a later `RUN` -- leaves a window in which
+          the file exists with the wrong owner, and leaves a second layer
+          that contains the original, root-owned copy. The bytes of a
+          root-owned file are still in the layer below even after you delete
+          it.
+
+          `COPY --chown` also accepts numeric ids (`--chown=1000:1000`),
+          which is the safer form if the base image might rename or renumber
+          its users.
+
+          The third check is the one that matters at run time: `test -w`
+          asks the kernel the same question the application will ask when
+          it tries to update its own file.
+        tags: [dockerfile, files, security]
+      - id: a-writable-data-directory
+        title: Give the process somewhere to write
+        prompt: |
+          The application writes a file into `/data` every time it starts.
+          The image below creates `/data` as root, so the write fails as
+          soon as the container drops to a non-root user.
+
+          Make it work: `/data` must exist, it must belong to the `app`
+          user, and the file the application writes must end up owned by
+          uid 1000.
+
+          The image must print the uid of the file it just wrote.
+        kind: image
+        entry_file: Dockerfile
+        files:
+          Dockerfile: |
+            FROM alpine:3.20
+
+            RUN adduser -D -u 1000 app
+
+            RUN mkdir -p /data
+
+            USER app
+
+            CMD ["sh", "-c", "echo payload > /data/out.txt && stat -c '%u' /data/out.txt"]
+        solution:
+          Dockerfile: |
+            FROM alpine:3.20
+
+            RUN adduser -D -u 1000 app
+
+            RUN mkdir -p /data && chown app:app /data
+
+            USER app
+
+            CMD ["sh", "-c", "echo payload > /data/out.txt && stat -c '%u' /data/out.txt"]
+        checks:
+          - name: the image prints the owner of the file it wrote
+            kind: default
+          - name: the directory belongs to the app user
+            kind: run
+            command: stat -c '%U' /data
+          - name: the process can write to the directory
+            kind: run
+            command: test -w /data && echo writable
+        cases:
+          - name: the default run
+        hints:
+          - "Create the directory and change its owner in the same `RUN`, before the `USER` instruction: `RUN mkdir -p /data && chown app:app /data`."
+          - "A `chown` after the `USER` instruction would fail, because a non-root process cannot change a file's owner."
+          - "`stat -c '%U' /data` prints the user that owns the directory."
+        teach: |
+          This is the same ownership rule as the previous exercise, applied
+          to a directory instead of a file, and it is the single most common
+          way a containerised application fails at start-up: the image
+          looks right, the user is right, and the process still cannot write
+          its state.
+
+          The ordering is what makes it work. The `RUN` that creates and
+          `chown`s the directory has to come *before* the `USER`
+          instruction, because `chown` needs privilege. Change the
+          ownership first, drop privilege second.
+
+          The alternative, which is also common, is to give the directory
+          to a group and let the process join it with `setgid` on the
+          directory. That is what `chmod g+s` plus a group membership buys
+          you, and it is the right answer when several users share a
+          directory. For one user, `chown` is simpler.
+
+          The check on the written file is the point of the exercise: the
+          file's owner is uid 1000, not 0, which means the process really
+          did the write as itself.
+        tags: [dockerfile, files, security]
+      - id: a-root-in-container
+        title: Root in a container is not root on the host
+        prompt: |
+          A container named `trainer-a-root-demo` is already running. It was
+          started without `--user`, so its process runs as uid 0 -- and it
+          is not privileged, and it can only touch the host through the one
+          file that was deliberately shared with it.
+
+          Write a script that prints three lines and nothing else:
+
+          1. the uid the container's process runs as;
+          2. whether the container is privileged, as `true` or `false`;
+          3. the contents of `shared.txt` in the working directory.
+
+          To get the third line, have the container write the single word
+          `changed` into its copy of that file at `/mnt/shared.txt`, and
+          then read the file in the working directory.
+
+          The file is shared deliberately, which is the point: the container
+          could not have reached it otherwise.
+        kind: cli
+        entry_file: solve.sh
+        files:
+          "solve.sh": |
+            # Your commands here.
+        solution:
+          "solve.sh": |
+            docker exec trainer-a-root-demo id -u
+            docker inspect --format '{{.HostConfig.Privileged}}' trainer-a-root-demo
+            docker exec trainer-a-root-demo sh -c 'echo changed > /mnt/shared.txt'
+            cat shared.txt
+        setup:
+          - "printf 'original\\n' > shared.txt"
+          - "docker rm -f trainer-a-root-demo"
+          - "docker run -d --name trainer-a-root-demo -v \"$(pwd)/shared.txt:/mnt/shared.txt\" alpine:3.20 sleep 300"
+        teardown:
+          - "docker rm -f trainer-a-root-demo"
+        checks:
+          - name: the script's output
+            kind: script
+            command: sh solve.sh
+        cases:
+          - name: the default run
+        hints:
+          - "`docker exec <container> <command>` runs a command inside a running container."
+          - "`docker inspect --format '{{.HostConfig.Privileged}}' <container>` prints whether the container was started with host privileges."
+          - "The container's own filesystem is its own; only `/mnt/shared.txt` was shared with it, so that is the only thing it can change."
+        teach: |
+          The three lines say three different things.
+
+          The first says that the container's process is uid 0. That is
+          Docker's default and it is worth noticing every time: the
+          container did not have to be told to run as root, it was simply
+          never told otherwise.
+
+          The second says that uid 0 inside the container is not the same
+          authority as uid 0 on the host. A privileged container gets the
+          host's devices, the host's namespaces and effectively all
+          capabilities. An ordinary container gets fourteen capabilities and
+          its own namespaces, and there is no flag in the container's
+          configuration that grants more.
+
+          The third is the caveat that matters in practice. Isolation is
+          not a property of the container; it is a property of what you
+          chose to share. A bind mount hands the container's root a direct
+          path to the host's file, and the write succeeds -- the container's
+          root is the host's root as far as that file is concerned. Every
+          `-v`, every `--mount`, every socket you pass in is a hole
+          deliberately cut in the isolation.
+
+          So "root in a container is not the host's root" is true, and
+          "root in a container is harmless" is not. The safe version of the
+          first statement is the second lesson: run as a named, non-root
+          user, and share nothing you did not mean to share.
+        tags: [security, cli, operations]
+  - id: a-healthchecks
+    title: Healthchecks
+    summary: How a container says it is ready, and how to wait for that instead of guessing.
+    body: |
+      # Healthchecks
+
+      A container that has started is not the same as a container that is
+      ready. The process may be running while it is still opening
+      databases, warming caches or waiting for a certificate. A healthcheck
+      is how a container says "not yet" and then says "now".
+
+      ## The instruction
+
+      ```dockerfile
+      HEALTHCHECK --interval=10s --timeout=3s --retries=3 \
+        CMD ["/usr/local/bin/probe.sh"]
+      ```
+
+      Three options and a command:
+
+      | Option | Meaning | Default |
+      | --- | --- | --- |
+      | `--interval` | how long to wait between probes | 30s |
+      | `--timeout` | how long one probe may run before it is killed | 30s |
+      | `--retries` | consecutive failures before the container is unhealthy | 3 |
+      | `--start-period` | a grace period during which failures are not counted | 0s |
+
+      The command is either `CMD ["prog", "arg"]`, which Docker runs
+      directly, or `CMD some command`, which Docker runs through
+      `/bin/sh -c`. The exec form is the better default: it does not
+      depend on a shell being in the image, and it does not leave the
+      argument to the shell's word splitting.
+
+      ## The three states
+
+      A container with a healthcheck is in one of three states:
+
+      - **starting** -- the healthcheck has not failed enough times yet.
+      - **healthy** -- the last probe succeeded.
+      - **unhealthy** -- the probe failed `--retries` times in a row.
+
+      Only the exit code of the probe matters. Its output is ignored,
+      except that Docker keeps the last few probe outputs in the health log
+      so that you can read them after the fact.
+
+      ```bash
+      docker inspect --format '{{.State.Health.Status}}' my-container
+      docker inspect --format '{{(index .State.Health.Log 0).ExitCode}}' my-container
+      ```
+
+      ## Waiting, not guessing
+
+      A healthcheck is only useful if something acts on it. Compose can:
+
+      ```yaml
+      services:
+        db:
+          image: postgres:16
+          healthcheck:
+            test: ["CMD-SHELL", "pg_isready -U postgres"]
+            interval: 5s
+            retries: 3
+        app:
+          image: myapp:1
+          depends_on:
+            db:
+              condition: service_healthy
+      ```
+
+      `condition: service_healthy` means "do not start `app` until `db`'s
+      healthcheck has passed". The other conditions are `service_started`
+      (the default: the container was created) and `service_completed`
+      (the container exited successfully).
+
+      Outside compose, the same idea is a polling loop:
+
+      ```bash
+      until [ "$(docker inspect --format '{{.State.Health.Status}}' my-container)" = "healthy" ]; do
+        sleep 1
+      done
+      ```
+
+      > **Callout**
+      > `docker run` does not wait. It returns as soon as the container
+      > starts. Anything that needs a healthy container has to ask for one.
+
+      ## Overriding the image
+
+      The healthcheck is a property of the *image*, and every container
+      started from it inherits one. That is usually what you want, and
+      occasionally exactly what you do not:
+
+      ```bash
+      docker run --no-healthcheck my-image:1
+      ```
+
+      turns it off for one container without touching the image.
+    exercises:
+      - id: a-add-a-healthcheck
+        title: Add a healthcheck that fails when the service is down
+        prompt: |
+          The service in this image is ready when the file `/app/ready`
+          exists.
+
+          Write the probe script in the `probe.sh` file so that it exits 0
+          when the service is ready and 1 when it is not, and install it in
+          the image at `/usr/local/bin/probe.sh`. Add a `HEALTHCHECK` that
+          runs it.
+
+          The healthcheck must use `--interval=10s`, `--timeout=3s` and
+          `--retries=3`.
+        kind: image
+        entry_file: Dockerfile
+        files:
+          "probe.sh": |
+            #!/bin/sh
+            # Exit 0 when the service is ready, 1 when it is not.
+            # The service is ready when /app/ready exists.
+            exit 0
+          Dockerfile: |
+            FROM alpine:3.20
+
+            RUN mkdir -p /app && touch /app/ready
+
+            COPY probe.sh /usr/local/bin/probe.sh
+
+            # Make the probe executable, then add the HEALTHCHECK.
+
+            CMD ["sh", "-c", "echo service started"]
+        solution:
+          "probe.sh": |
+            #!/bin/sh
+            # Exit 0 when the service is ready, 1 when it is not.
+            # The service is ready when /app/ready exists.
+            test -f /app/ready
+          Dockerfile: |
+            FROM alpine:3.20
+
+            RUN mkdir -p /app && touch /app/ready
+
+            COPY probe.sh /usr/local/bin/probe.sh
+
+            RUN chmod +x /usr/local/bin/probe.sh
+
+            HEALTHCHECK --interval=10s --timeout=3s --retries=3 \
+              CMD ["/usr/local/bin/probe.sh"]
+
+            CMD ["sh", "-c", "echo service started"]
+        checks:
+          - name: the image declares a healthcheck
+            kind: inspect
+            template: "{{if .Config.Healthcheck}}present{{else}}absent{{end}}"
+          - name: the healthcheck runs every ten seconds
+            kind: inspect
+            template: "{{.Config.Healthcheck.Interval}}"
+          - name: the probe succeeds when the service is ready
+            kind: run
+            command: /usr/local/bin/probe.sh; echo "exit=$?"
+          - name: the probe fails when the service is down
+            kind: run
+            command: rm -f /app/ready; /usr/local/bin/probe.sh; echo "exit=$?"
+          - name: the image still starts
+            kind: default
+        cases:
+          - name: the default run
+        hints:
+          - "The probe is a shell script: `test -f /app/ready` exits 0 when the file is there and 1 when it is not."
+          - "A file copied into an image is not executable until you say so: `RUN chmod +x /usr/local/bin/probe.sh`."
+          - "The healthcheck instruction is `HEALTHCHECK --interval=10s --timeout=3s --retries=3 CMD [\"/usr/local/bin/probe.sh\"]`."
+        teach: |
+          A healthcheck is a command the daemon runs inside the container
+          over and over. Its exit code is the whole message: 0 means
+          healthy, anything else means not. Docker does not read the
+          output, does not match it against a pattern, and does not care
+          whether the probe printed "unhealthy" or "everything is fine".
+          A probe that always exits 0 turns the healthcheck into decoration,
+          which is the most common way healthchecks go wrong.
+
+          That is why the exercise checks the probe twice: once with the
+          service ready and once with the marker removed. The second check
+          is the one that catches a probe that only ever succeeds.
+
+          The interval and timeout are properties of the image
+          configuration. `docker image inspect --format
+          '{{.Config.Healthcheck.Interval}}'` prints them as a duration,
+          and the same field in the raw JSON that `docker image inspect`
+          prints without a format is `10000000000` -- ten seconds in
+          nanoseconds. That is the price of using an integer field
+          everywhere: the API, Kubernetes and every library that has to
+          talk to them all want the same number.
+
+          The probe runs as the container's user, in the container's
+          filesystem, with the container's environment. A probe that needs
+          to read a file it cannot read, or a binary that is not in the
+          image, fails in a way that looks exactly like an unhealthy
+          service.
+        tags: [healthchecks, dockerfile, security]
+      - id: a-healthcheck-in-compose
+        title: Wait for a healthy dependency
+        prompt: |
+          Write a compose project with two services.
+
+          `db` runs `alpine:3.20` and has a healthcheck whose test is
+          `["CMD-SHELL", "exit 0"]`, with `interval: 5s` and `retries: 3`.
+
+          `app` also runs `alpine:3.20`. It must not start until `db` is
+          healthy, and it must have a healthcheck of its own, with the test
+          `["CMD", "true"]`, `interval: 5s` and `retries: 3`.
+
+          The file must be called `compose.yaml`.
+        kind: compose
+        entry_file: compose.yaml
+        files:
+          "compose.yaml": |
+            # Your compose project here.
+            services:
+              db:
+                image: alpine:3.20
+        solution:
+          "compose.yaml": |
+            services:
+              db:
+                image: alpine:3.20
+                healthcheck:
+                  test: ["CMD-SHELL", "exit 0"]
+                  interval: 5s
+                  retries: 3
+              app:
+                image: alpine:3.20
+                depends_on:
+                  db:
+                    condition: service_healthy
+                healthcheck:
+                  test: ["CMD", "true"]
+                  interval: 5s
+                  retries: 3
+        checks:
+          - name: the project configuration
+            kind: config
+          - name: the app service runs
+            kind: service
+            service: app
+            command: cat /etc/alpine-release
+        cases:
+          - name: the default run
+        settings:
+          ignore_paths:
+            - services.db.command
+            - services.db.entrypoint
+            - services.app.command
+            - services.app.entrypoint
+        hints:
+          - "A service's healthcheck is a `healthcheck` key with a `test`, an `interval` and a `retries`."
+          - "`depends_on` takes a mapping of service name to a mapping of conditions: `db: {condition: service_healthy}`."
+          - "The conditions are `service_started`, `service_healthy` and `service_completed`."
+        teach: |
+          `depends_on` used to mean only "start this first", and that is
+          still what it means unless you say otherwise. `condition:
+          service_healthy` changes the meaning to "start this only once
+          that one reports healthy", which is the behaviour an application
+          almost always wants: a migration tool that connects to a
+          database, a web server that needs its certificate, a worker that
+          reads a queue.
+
+          The condition is evaluated against the *health status*, not
+          against the process. A container that is running but whose
+          healthcheck has not passed yet is still `starting`, and
+          `service_healthy` waits for it.
+
+          Note that the healthcheck belongs to the service, not to the
+          image. `docker compose` sends the healthcheck to the daemon when
+          it creates the container, exactly as it would if you had passed
+          `--health-cmd` to `docker run`.
+
+          Compose also offers `docker compose up --wait`, which starts the
+          project and blocks until every service with a healthcheck is
+          healthy. It is the same idea expressed as a command rather than
+          as a dependency edge, and it is the one to reach for in a
+          script or a CI job.
+        tags: [compose, healthchecks, operations]
+      - id: a-wait-for-healthy
+        title: Wait for a container to become healthy
+        prompt: |
+          A container named `trainer-a-health-demo` is already running. Its
+          healthcheck takes a couple of seconds to pass, so it starts out
+          in the `starting` state.
+
+          Write a script that waits until the container reports `healthy`
+          and then prints that status on a line of its own. If the
+          container never becomes healthy, print `timed out` instead --
+          but do not wait forever.
+        kind: cli
+        entry_file: solve.sh
+        files:
+          "solve.sh": |
+            # Your commands here.
+        solution:
+          "solve.sh": |
+            i=0
+            while [ "$i" -lt 30 ]; do
+              status=$(docker inspect --format '{{.State.Health.Status}}' trainer-a-health-demo)
+              if [ "$status" = "healthy" ]; then
+                echo "$status"
+                exit 0
+              fi
+              i=$((i + 1))
+              sleep 1
+            done
+            echo "timed out"
+        setup:
+          - "docker rm -f trainer-a-health-demo"
+          - "docker run -d --name trainer-a-health-demo --health-cmd \"sleep 2; exit 0\" --health-interval 2s --health-retries 3 alpine:3.20 sleep 300"
+        teardown:
+          - "docker rm -f trainer-a-health-demo"
+        checks:
+          - name: the script's output
+            kind: script
+            command: sh solve.sh
+        cases:
+          - name: the default run
+        hints:
+          - "The status is in the container's inspect output: `docker inspect --format '{{.State.Health.Status}}' trainer-a-health-demo`."
+          - "A `while` loop with a counter is enough; the container needs a few seconds, not a few minutes."
+          - "Print the status you read, so the output is exactly `healthy`."
+        teach: |
+          Polling is unglamorous and it is what most real deployments
+          do, because there is no other way to ask a container whether it
+          is ready. The loop has three parts and all three matter: read the
+          status, decide whether it is good enough, and wait before trying
+          again. A loop without a bound is a hang; a loop without a wait is
+          a busy loop that hammers the daemon.
+
+          The value being polled is `starting` until the first successful
+          probe, then `healthy` or `unhealthy`. Polling for anything other
+          than `healthy` -- for `running`, or for the container to merely
+          exist -- is the mistake this exercise is about. `docker run`
+          returning successfully means the container was created, not that
+          it can serve traffic.
+
+          Compose has this built in (`depends_on` with a condition,
+          `docker compose up --wait`), and Kubernetes has it in a readiness
+          probe and in the readiness gate that gates traffic. The loop is
+          the version you write when you have neither.
+        tags: [healthchecks, cli, operations]
+      - id: a-read-the-health-log
+        title: Read why a container is unhealthy
+        prompt: |
+          A container named `trainer-a-health-demo` is running a healthcheck
+          that always fails.
+
+          Write a script that waits until the container reports `unhealthy`,
+          prints that status on a line of its own, and then prints on
+          another line the exit code Docker recorded for the health probe.
+
+          The exit code is the whole diagnosis: Docker keeps the last few
+          probes and what each one exited with.
+        kind: cli
+        entry_file: solve.sh
+        files:
+          "solve.sh": |
+            # Your commands here.
+        solution:
+          "solve.sh": |
+            i=0
+            while [ "$i" -lt 30 ]; do
+              status=$(docker inspect --format '{{.State.Health.Status}}' trainer-a-health-demo)
+              if [ "$status" = "unhealthy" ]; then
+                break
+              fi
+              i=$((i + 1))
+              sleep 1
+            done
+            echo "$status"
+            docker inspect --format '{{(index .State.Health.Log 0).ExitCode}}' trainer-a-health-demo
+        setup:
+          - "docker rm -f trainer-a-health-demo"
+          - "docker run -d --name trainer-a-health-demo --health-cmd \"exit 1\" --health-interval 1s --health-retries 2 alpine:3.20 sleep 300"
+        teardown:
+          - "docker rm -f trainer-a-health-demo"
+        checks:
+          - name: the script's output
+            kind: script
+            command: sh solve.sh
+        cases:
+          - name: the default run
+        hints:
+          - "The health status is at `.State.Health.Status` in the container's inspect output."
+          - "The probe log is at `.State.Health.Log`, a list; each entry has an `ExitCode` and the probe's `Output`."
+          - "`{{(index .State.Health.Log 0).ExitCode}}` prints the exit code of the first recorded probe."
+        teach: |
+          When a container is unhealthy, the useful question is not "is it
+          unhealthy" but "why". Docker answers the second question by
+          keeping a small log of the most recent probes: each entry has the
+          probe's exit code and whatever it printed.
+
+          The exit code is the diagnosis. `1` is a probe that failed on its
+          own terms -- the usual script is `test` or `curl` returning
+          non-zero. `126` or `127` mean the probe could not be executed at
+          all, which usually means the binary is not in the image or is not
+          executable. `137` is the probe being killed, most often because
+          it exceeded `--timeout`.
+
+          The probe's output is kept too, and it is worth printing, but it
+          is only diagnostic: Docker decided the container's health from
+          the exit code alone. A probe that prints a helpful message and
+          exits 0 has told Docker the service is fine, whatever the message
+          said.
+
+          Note that the log is bounded -- Docker keeps a handful of entries,
+          not an unbounded history -- so it answers "what is happening now",
+          not "what happened last Tuesday".
+        tags: [healthchecks, cli, operations]
+  - id: a-secrets-and-configuration
+    title: Secrets and configuration
+    summary: Getting credentials into a container without putting them in the image.
+    body: |
+      # Secrets and configuration
+
+      A secret that is baked into an image is not a secret. The image is a
+      layer in a registry that anybody with read access can pull, and every
+      layer of it can be unpacked.
+
+      ## Three different things
+
+      It helps to separate three kinds of runtime input, because Docker
+      gives each of them a different mechanism:
+
+      | | Where it lives | Who can see it | Changes without a rebuild |
+      | --- | --- | --- | --- |
+      | **Build arguments** | the build's cache key and history | everybody who can pull the image | no |
+      | **Environment variables** | the container's process environment | anybody who can read `/proc/<pid>/environ` | yes |
+      | **Files** (secrets, configs) | a file mounted into the container | only the container | yes |
+
+      Build arguments are the trap. `ARG` looks like `ENV` and is not:
+      an `ARG` exists during the build and is *recorded in the image's
+      history*. `docker history` shows the value.
+
+      ```dockerfile
+      ARG NPM_TOKEN=secret
+      RUN npm install --//registry:_authToken=$NPM_TOKEN
+      ```
+
+      That image now contains the token in its history, in plain text, for
+      as long as the image exists.
+
+      > **Callout**
+      > Anything a `RUN` can see, a later `docker history` can show.
+      > `ENV` and `ARG` values both end up there.
+
+      ## Environment variables at run time
+
+      The simplest correct answer is to supply the value when the container
+      starts:
+
+      ```bash
+      docker run -e DB_PASSWORD=... myapp:1
+      ```
+
+      The value is not in the image, it is in the container's
+      configuration, and it can differ between two containers from the same
+      image. The cost is that environment variables are a poor fit for
+      secrets: they end up in `/proc/<pid>/environ`, they are inherited by
+      every child process, and they are visible to anything that can read
+      the process's environment.
+
+      ## Files at run time
+
+      A file is a better shape for a secret, because access can be
+      controlled by ownership and mode rather than by convention. Compose
+      has two mechanisms for this:
+
+      ```yaml
+      services:
+        app:
+          image: myapp:1
+          secrets:
+            - db_password
+          configs:
+            - app_config
+
+      secrets:
+        db_password:
+          file: ./db_password.txt
+
+      configs:
+        app_config:
+          file: ./app.conf
+      ```
+
+      A secret is mounted at `/run/secrets/<name>`. A config is mounted at
+      `/<name>`. Both are mounted read-only, and both are provided when the
+      container starts, not when the image is built.
+
+      The difference between a secret and a config is intent, not
+      mechanism: configs are for settings that are not sensitive, secrets
+      are for credentials. In a Swarm deployment a config is distributed to
+      every node and a secret is encrypted in transit and at rest.
+
+      ## Secrets at build time
+
+      A build sometimes needs a credential -- to fetch a private package,
+      to clone a private repository. Baking it in is wrong, and passing it
+      as a build argument is wrong too, because build arguments are
+      recorded.
+
+      BuildKit has a mount for it:
+
+      ```dockerfile
+      # syntax=docker/dockerfile:1
+      FROM alpine:3.20
+      RUN --mount=type=secret,id=npm_token \
+      npm install --//registry:_authToken=$(cat /run/secrets/npm_token)
+      ```
+
+      The secret is mounted into that one instruction and nowhere else. It
+      is not written into the layer, and it does not appear in the image's
+      history. Compose wires it up with a `build` section:
+
+      ```yaml
+      services:
+        app:
+          build:
+            context: .
+            secrets:
+              - npm_token
+      secrets:
+        npm_token:
+          file: ./npm_token.txt
+      ```
+
+      ## The build context
+
+      One more thing not to forget: the build context is *sent to the
+      daemon*. A file in the context is a file that crossed the wire, and
+      a file that is `COPY`ed into the image is a file in a layer.
+
+      A `.dockerignore` in the context root keeps files out of both. It
+      works on patterns, the same way `.gitignore` does:
+
+      ```
+      *.pem
+      credentials.json
+      .git
+      ```
+
+      > **Callout**
+      > Deleting a secret in a later `RUN` does not remove it. The bytes
+      > are still in the layer underneath. Delete it in the same `RUN` that
+      > created it, or never put it there.
+    exercises:
+      - id: a-credentials-at-runtime
+        title: Take the credential at run time, not at build time
+        prompt: |
+          The application connects to the database with the password in
+          `DB_PASSWORD`. The script below ignores it and connects anyway.
+
+          Fix it: with the password in the environment the container must
+          print `connected to the database`; without it, it must print
+          `DB_PASSWORD is not set` and exit non-zero.
+
+          The image must not contain the password. Nothing in the
+          Dockerfile may bake a value into the image.
+        kind: image
+        entry_file: Dockerfile
+        files:
+          "start.sh": |
+            #!/bin/sh
+            # Connect to the database. The password is in DB_PASSWORD.
+            echo "connected to the database"
+          Dockerfile: |
+            # Your Dockerfile here.
+            FROM alpine:3.20
+        solution:
+          "start.sh": |
+            #!/bin/sh
+            # Connect to the database. The password is in DB_PASSWORD.
+            if [ -z "${DB_PASSWORD}" ]; then
+              echo "DB_PASSWORD is not set"
+              exit 1
+            fi
+            echo "connected to the database"
+          Dockerfile: |
+            FROM alpine:3.20
+
+            COPY start.sh /app/start.sh
+
+            RUN chmod +x /app/start.sh
+
+            CMD ["/app/start.sh"]
+        checks:
+          - name: the image does not carry the password
+            kind: run
+            command: printenv | grep -c DB_PASSWORD || true
+          - name: the application connects when the password is supplied
+            kind: run
+            command: DB_PASSWORD=probe /app/start.sh
+          - name: the application refuses to start without the password
+            kind: run
+            command: /app/start.sh; echo "exit=$?"
+          - name: the image runs its own command
+            kind: default
+        cases:
+          - name: the default run
+        hints:
+          - "An environment variable is read with `\"${DB_PASSWORD}\"`, and `[ -z \"${DB_PASSWORD}\" ]` is true when it is empty or unset."
+          - "The script has to be copied into the image and made executable: `COPY start.sh /app/start.sh` then `RUN chmod +x /app/start.sh`."
+          - "A password baked in with `ENV` or `ARG` ends up in the image's configuration, which is exactly what the first check is about."
+        teach: |
+          The environment is the right shape for a value that changes
+          between two runs of the same image, which is exactly what a
+          credential is: the same image runs in staging and in production
+          against different databases.
+
+          The thing to avoid is `ENV`. `ENV DB_PASSWORD=...` writes the
+          value into the image configuration, where it is readable by
+          anybody who can pull the image and visible in `docker history`.
+          `ARG` is worse, for the same reason plus one: build arguments
+          are part of the build's cache key, so a changing credential
+          invalidates the cache and rebuilds every layer after it.
+
+          The check on `printenv` is what proves the value is not baked in.
+          It counts the occurrences of the variable's name in the running
+          container's environment, and the answer has to be zero: an image
+          that carries the password in an `ENV` answers one, and an image
+          that reads it from the environment the container was started with
+          answers zero.
+
+          Failing loudly is the other half. A container that starts
+          happily without its credential and then fails on the first
+          request is much harder to diagnose than one that refuses to
+          start and says why. The exit code matters as much as the
+          message: a supervisor needs a non-zero exit to know that the
+          container did not come up.
+        tags: [security, config, dockerfile]
+      - id: a-keep-secrets-out-of-the-context
+        title: Keep the credential out of the build context
+        prompt: |
+          The build context contains `credentials.json`, which holds a
+          database password, and `app.txt`, which the application needs.
+
+          The credential must not reach the daemon and must not reach the
+          image. Exclude it with a `.dockerignore`, and keep the rest of
+          the context.
+
+          The `RUN` instruction at the top of the Dockerfile mounts the
+          build context at `/ctx` and records its listing in
+          `/ctx-listing.txt`, so that what the daemon received can be
+          checked.
+
+          The image must still contain `/app/app.txt`.
+        kind: image
+        entry_file: Dockerfile
+        files:
+          ".dockerignore": |
+            # One pattern per line.
+          "credentials.json": |
+            {"db_password": "s3cr3t-db-password"}
+          "app.txt": |
+            release=1.0.0
+          Dockerfile: |
+            # syntax=docker/dockerfile:1
+            FROM alpine:3.20
+
+            RUN --mount=type=bind,target=/ctx ls -A /ctx > /ctx-listing.txt
+
+            COPY . /app
+
+            CMD ["sh", "-c", "echo app image ready"]
+        solution:
+          ".dockerignore": |
+            credentials.json
+          "credentials.json": |
+            {"db_password": "s3cr3t-db-password"}
+          "app.txt": |
+            release=1.0.0
+          Dockerfile: |
+            # syntax=docker/dockerfile:1
+            FROM alpine:3.20
+
+            RUN --mount=type=bind,target=/ctx ls -A /ctx > /ctx-listing.txt
+
+            COPY . /app
+
+            CMD ["sh", "-c", "echo app image ready"]
+        checks:
+          - name: the context did not contain the credential
+            kind: run
+            command: grep -c credentials.json /ctx-listing.txt || true
+          - name: the credential is not in the image
+            kind: run
+            command: test ! -e /app/credentials.json && echo "not in the image"
+          - name: the application file is in the image
+            kind: run
+            command: test -f /app/app.txt && echo "app.txt copied"
+          - name: the image still starts
+            kind: default
+        cases:
+          - name: the default run
+        hints:
+          - "A `.dockerignore` in the root of the build context lists patterns, one per line: the file name on its own is enough."
+          - "The `.dockerignore` is read from the root of the context, and it applies to the files that are sent to the daemon."
+          - "The bind mount needs the Dockerfile syntax line at the top: `# syntax=docker/dockerfile:1`."
+        teach: |
+          The build context is the set of files the daemon receives. Every
+          file in it is uploaded, and every file in it that a `COPY` or an
+          `ADD` picks up becomes part of a layer. A credential in the
+          context is therefore uploaded and, if it is copied, stored.
+
+          `.dockerignore` is the filter for that upload. It is evaluated
+          against the paths relative to the context root, and it uses the
+          same pattern syntax as `.gitignore`: `credentials.json` excludes
+          one file, `*.pem` excludes a family, and a leading `!` re-includes
+          something. It is worth putting a `.dockerignore` in every
+          repository, even an empty one, because it documents the
+          assumption that everything in the context may be sent.
+
+          The bind mount is how the exercise can see the context at all.
+          `--mount=type=bind,target=/ctx` mounts the context -- after
+          `.dockerignore` has been applied -- into that one instruction, so
+          `ls -A /ctx` shows exactly what the daemon received. It is a
+          debugging tool worth knowing: it turns an invisible step into an
+          observable one.
+
+          Deleting the file in a later `RUN` would not do. The layers are
+          diffs, and the bytes of a file that was copied and then removed
+          are still in the layer that copied it.
+        tags: [security, files, dockerfile]
+      - id: a-compose-secrets
+        title: Mount a secret and a config into a service
+        prompt: |
+          Write a compose project with one service, `app`, that runs
+          `alpine:3.20` and reads two files:
+
+          - a secret named `db_password`, mounted from the file
+            `db_password.txt` in the project directory;
+          - a config named `app_config`, mounted from the file `app.conf`
+            in the project directory.
+
+          Compose mounts a secret at `/run/secrets/db_password` and a
+          config at `/app_config`. Both source files are already in the
+          project directory; leave their contents alone.
+
+          The file must be called `compose.yaml`.
+        kind: compose
+        entry_file: compose.yaml
+        files:
+          "compose.yaml": |
+            # Your compose project here.
+            services:
+              app:
+                image: alpine:3.20
+          "db_password.txt": |
+            s3cr3t-db-password
+          "app.conf": |
+            mode=production
+        solution:
+          "db_password.txt": |
+            s3cr3t-db-password
+          "app.conf": |
+            mode=production
+          "compose.yaml": |
+            services:
+              app:
+                image: alpine:3.20
+                secrets:
+                  - db_password
+                configs:
+                  - app_config
+
+            secrets:
+              db_password:
+                file: ./db_password.txt
+
+            configs:
+              app_config:
+                file: ./app.conf
+        checks:
+          - name: the project configuration
+            kind: config
+          - name: the secret is mounted
+            kind: service
+            service: app
+            command: cat /run/secrets/db_password
+          - name: the config is mounted
+            kind: service
+            service: app
+            command: cat /app_config
+        cases:
+          - name: the default run
+        settings:
+          ignore_paths:
+            - services.app.command
+            - services.app.entrypoint
+            - value.secrets
+            - value.configs
+        hints:
+          - "A service lists the secrets and configs it wants by name; the project defines where each name comes from."
+          - "The secret is defined at the top level of the file, next to `services`, not inside the service."
+          - "`file: ./db_password.txt` is a path relative to the compose file."
+        teach: |
+          Compose separates the *declaration* from the *source*. The
+          service says which secrets and configs it wants; the top-level
+          `secrets` and `configs` sections say where they come from. That
+          split is what lets the same compose file run against a local
+          file in development and against a secret manager in production
+          without the service definition changing.
+
+          The two mount at different places, and the difference is
+          deliberate. A secret lands in `/run/secrets/<name>`, a directory
+          that applications have looked for since the Docker secrets
+          convention was agreed, and it is mounted read-only. A config
+          lands in `/<name>` at the root of the filesystem, which is a
+          shorter path for configuration that an application reads as a
+          plain file.
+
+          Neither value is in the image. The container gets them when it
+          starts, so the same image can be promoted from one environment
+          to the next without being rebuilt -- and a leaked image does not
+          leak the credential with it.
+
+          In Swarm, the difference between the two is stronger still: a
+          config is distributed to every node in the cluster in the clear,
+          while a secret is encrypted in transit and at rest, and the
+          daemon only decrypts it for the containers that ask for it.
+        tags: [compose, security, config]
+      - id: a-build-secret
+        title: Use a secret during the build, and nowhere else
+        prompt: |
+          The build needs a token. It must be available while the image is
+          built, and it must not be in the image afterwards.
+
+          Declare `api_token` as a secret of the `app` service's build,
+          sourced from the file `api_token.txt` in the project directory.
+          In the Dockerfile, mount it into a single `RUN` with
+          `--mount=type=secret,id=api_token` and record that the token was
+          there, by writing a file `/build-token-present`.
+
+          The image must not contain the secret afterwards: there must be
+          no `/run/secrets` directory in it.
+        kind: compose
+        entry_file: compose.yaml
+        files:
+          "compose.yaml": |
+            # Your compose project here.
+            services:
+              app:
+                build:
+                  context: .
+          "api_token.txt": |
+            t0k3n-from-the-build
+          Dockerfile: |
+            # syntax=docker/dockerfile:1
+            FROM alpine:3.20
+
+            # Mount the secret here and record that it was available.
+        solution:
+          "compose.yaml": |
+            services:
+              app:
+                build:
+                  context: .
+                  secrets:
+                    - api_token
+
+            secrets:
+              api_token:
+                file: ./api_token.txt
+          "api_token.txt": |
+            t0k3n-from-the-build
+          Dockerfile: |
+            # syntax=docker/dockerfile:1
+            FROM alpine:3.20
+
+            RUN --mount=type=secret,id=api_token \
+              test -s /run/secrets/api_token && \
+              echo "token was available at build time" > /build-token-present
+        checks:
+          - name: the project configuration
+            kind: config
+          - name: the token was available during the build
+            kind: service
+            service: app
+            command: test -s /build-token-present && echo "the token was available at build time"
+          - name: the token is not in the image
+            kind: service
+            service: app
+            command: test ! -e /run/secrets && echo "no secret in the image"
+        cases:
+          - name: the default run
+        settings:
+          ignore_paths:
+            - services.app.command
+            - services.app.entrypoint
+            - value.secrets
+        hints:
+          - "A build secret is declared under the service's `build` section, in a `secrets` list, and defined at the top level of the file."
+          - "In the Dockerfile, `RUN --mount=type=secret,id=api_token` puts the secret at `/run/secrets/api_token` for that instruction only."
+          - "The mount is not part of the image: after the build, `/run/secrets` does not exist."
+        teach: |
+          This is the difference between a build secret and a runtime
+          secret, in one file. The build secret is available to the
+          instructions that need it and to nothing else; the runtime
+          secret is available to the running container and to nothing else.
+          Neither ever becomes part of the image.
+
+          The mechanism is a mount, not an environment variable. The
+          secret appears as a file at `/run/secrets/<id>` for the duration
+          of that one `RUN`, and the layer the instruction produces contains
+          whatever the command wrote -- not the secret itself. The
+          reference proves this: the `RUN` writes a marker saying the
+          token was there, and the finished image has no `/run/secrets`
+          directory at all.
+
+          Compare it with the two alternatives. `ARG TOKEN` records the
+          value in the image's history. `ENV TOKEN` records it in the
+          image's configuration. Both are readable by anybody who can pull
+          the image, and both are recorded permanently, even if a later
+          layer deletes the file.
+
+          Compose wires the build secret up for you: it passes the file to
+          the builder under the name you gave it, so the Dockerfile's
+          `id` and the compose file's secret name have to agree.
+        tags: [compose, buildkit, security]
+  - id: a-buildkit-and-cache
+    title: BuildKit and caching
+    summary: How to build fast without shipping the build machinery.
+    body: |
+      # BuildKit and caching
+
+      BuildKit is the builder behind `docker build` in current Docker
+      versions. It differs from the older builder in ways that matter:
+      it builds stages in parallel, it can mount things into a build
+      without leaving them in the image, and it can export and import
+      caches.
+
+      ## Layers and the cache
+
+      Every instruction in a Dockerfile produces a layer, and each layer is
+      keyed by what came before it plus the instruction itself. If the key
+      matches a layer BuildKit already has, the instruction is not run
+      again -- it is reused. That is why adding a `RUN` at the *bottom* of
+      a Dockerfile is cheap and adding one at the *top* rebuilds
+      everything below it.
+
+      The cache is a function of the build's inputs, and one of those
+      inputs is the build context. Change a file that a `COPY` reads and
+      every layer from that `COPY` onwards is invalidated.
+
+      ## Cache mounts
+
+      Some build steps want a cache directory: a package manager's
+      download cache, a compiler's object cache. Putting that directory in
+      the image makes the image bigger and makes it stale. BuildKit can
+      mount it instead:
+
+      ```dockerfile
+      # syntax=docker/dockerfile:1
+      FROM python:3.14-slim
+      RUN --mount=type=cache,target=/root/.cache/pip \
+          pip install --cache-dir /root/.cache/pip requests
+      ```
+
+      The directory is real for the duration of the instruction, it is
+      shared with every other build that uses the same mount, and it is
+      **not** part of the image. The next build starts with whatever the
+      previous build left there, which is the entire point: the download
+      happens once, not once per image.
+
+      The `id` option names the cache so that two instructions can share
+      it deliberately:
+
+      ```dockerfile
+      RUN --mount=type=cache,target=/root/.cache,id=buildkit-cache \
+          make -j8
+      ```
+
+      ## Secret mounts
+
+      The same idea applies to credentials, with the difference that the
+      value is not shared and is not kept:
+
+      ```dockerfile
+      RUN --mount=type=secret,id=npm_token \
+          npm install --//registry:_authToken=$(cat /run/secrets/npm_token)
+      ```
+
+      A secret mount is per-instruction and never enters a layer. A cache
+      mount is shared between builds and never enters a layer either.
+
+      ## Parallel stages
+
+      A multi-stage build compiles in one image and ships from another:
+
+      ```dockerfile
+      # syntax=docker/dockerfile:1
+      FROM golang:1.23 AS builder
+      WORKDIR /src
+      COPY . .
+      RUN go build -o /out/app ./cmd/app
+
+      FROM alpine:3.20
+      COPY --from=builder /out/app /usr/local/bin/app
+      CMD ["/usr/local/bin/app"]
+      ```
+
+      Only the final stage becomes the image. The compiler, the sources
+      and the build cache stay in the stage that is thrown away. Stages
+      that do not depend on each other are built concurrently, so a
+      frontend build and a backend build in the same Dockerfile overlap
+      instead of queueing.
+
+      ## Bringing a cache with you
+
+      A build on a fresh machine has no cache, and re-running the base
+      image's steps is slow. `--cache-from` points the builder at an image
+      whose layers it may reuse:
+
+      ```bash
+      docker build --cache-from myapp:1 --cache-from alpine:3.20 .
+      ```
+
+      This only pays off when the local cache does not already have the
+      layers -- on a fresh CI worker, or when the layers come from a
+      registry that was never pulled. `docker buildx build --cache-to
+      type=registry,ref=myapp:cache` pushes a cache to a registry, and
+      `--cache-from type=registry,ref=myapp:cache` reads it back.
+
+      Compose has the same thing declaratively:
+
+      ```yaml
+      services:
+        app:
+          build:
+            context: .
+            cache_from:
+              - alpine:3.20
+      ```
+    exercises:
+      - id: a-cache-mount
+        title: Mount a cache directory instead of shipping it
+        prompt: |
+          The build downloads an artefact into `/var/cache/build` and then
+          copies it into the image.
+
+          Mount `/var/cache/build` as a BuildKit cache mount, so that the
+          download is reused by later builds and the cache directory
+          itself is not part of the image.
+
+          The artefact must end up in the image at `/opt/artefact.txt`, and
+          `/var/cache/build` must not exist in it. The contents of the
+          artefact are up to you.
+        kind: image
+        entry_file: Dockerfile
+        files:
+          Dockerfile: |
+            # syntax=docker/dockerfile:1
+            FROM alpine:3.20
+
+            # Download into the cache mount, then copy the artefact out.
+
+            CMD ["sh", "-c", "echo built"]
+        solution:
+          Dockerfile: |
+            # syntax=docker/dockerfile:1
+            FROM alpine:3.20
+
+            RUN --mount=type=cache,target=/var/cache/build \
+              echo "downloaded artefact" > /var/cache/build/artefact.txt && \
+              cp /var/cache/build/artefact.txt /opt/artefact.txt
+
+            CMD ["sh", "-c", "echo built"]
+        checks:
+          - name: the artefact is in the image
+            kind: run
+            command: test -s /opt/artefact.txt && echo "the artefact is in the image"
+          - name: the cache directory is not in the image
+            kind: run
+            command: test ! -e /var/cache/build && echo "not in the image"
+          - name: the image still starts
+            kind: default
+        cases:
+          - name: the default run
+        hints:
+          - "A cache mount is an option on `RUN`: `--mount=type=cache,target=/var/cache/build`."
+          - "The mount is only there for the duration of the instruction. Anything you want to keep has to be copied out of it."
+          - "The Dockerfile syntax line at the top tells BuildKit which frontend to use."
+        teach: |
+          A cache mount is a directory that exists during the build and
+          does not exist in the image. Inside the instruction it behaves
+          exactly like a normal directory -- you can read it, write to it,
+          and delete from it -- but when the instruction ends, BuildKit
+          keeps the directory aside and the layer records only what
+          changed outside it.
+
+          That gives you the two properties you want at once. The
+          download is not repeated, because the next build starts with the
+          directory already populated; and the image does not carry the
+          cache, because the cache was never part of a layer.
+
+          The `target` is the path *inside the container* during the
+          build. The `id` names the cache itself, and two instructions
+          that mount the same id share the same directory. Two
+          instructions with different ids do not, even if their targets
+          are the same path -- the path is where the cache appears, the id
+          is which cache appears.
+
+          The share is by default `shared`, which means two builds running
+          at the same time can write to the same cache directory. That is
+          usually what you want for a download cache and occasionally not
+          what you want for a cache that a build step mutates in place;
+          `sharing=private` gives the instruction its own copy.
+        tags: [buildkit, optimisation, layers]
+      - id: a-cache-mount-is-shared
+        title: Show that a cache mount survives between builds
+        prompt: |
+          The `Dockerfile` in this exercise builds an image that records
+          what it found in its cache mount: `cold` if the mount was empty,
+          `warm` if it was not.
+
+          Write a script that builds the image twice and prints what the
+          image said after each build, one line per build. The first build
+          must report `cold` and the second `warm`, because a cache mount
+          is shared between builds.
+
+          Two things make that work. Use the same cache id for both
+          builds, so that they share the cache; and use a *different*
+          `BUILD_ID` for each, so that the layer cache does not serve the
+          second build from the first one's result and hide what is
+          happening. The cache id must also be unique to this run, so that
+          the exercise starts from a cold cache.
+        kind: cli
+        entry_file: solve.sh
+        files:
+          "solve.sh": |
+            # Your commands here.
+          Dockerfile: |
+            # syntax=docker/dockerfile:1
+            FROM alpine:3.20
+
+            ARG CACHE_ID=default
+            ARG BUILD_ID=0
+
+            RUN --mount=type=cache,target=/cache,id=$CACHE_ID \
+              if [ -f /cache/marker ]; then echo warm > /result; else echo cold > /result; fi && \
+              echo "$BUILD_ID" > /cache/marker
+        solution:
+          "solve.sh": |
+            run_id="$(date +%s)-$$"
+            cache_id="trainer-cache-$run_id"
+
+            docker build --build-arg CACHE_ID="$cache_id" --build-arg BUILD_ID="$run_id-1" -t trainer-cache-demo:1 . >/dev/null 2>&1
+            docker run --rm trainer-cache-demo:1 cat /result
+
+            docker build --build-arg CACHE_ID="$cache_id" --build-arg BUILD_ID="$run_id-2" -t trainer-cache-demo:1 . >/dev/null 2>&1
+            docker run --rm trainer-cache-demo:1 cat /result
+          Dockerfile: |
+            # syntax=docker/dockerfile:1
+            FROM alpine:3.20
+
+            ARG CACHE_ID=default
+            ARG BUILD_ID=0
+
+            RUN --mount=type=cache,target=/cache,id=$CACHE_ID \
+              if [ -f /cache/marker ]; then echo warm > /result; else echo cold > /result; fi && \
+              echo "$BUILD_ID" > /cache/marker
+        setup:
+          - "docker image rm -f trainer-cache-demo:1"
+        teardown:
+          - "docker image rm -f trainer-cache-demo:1"
+        checks:
+          - name: the script's output
+            kind: script
+            command: sh solve.sh
+        cases:
+          - name: the default run
+        hints:
+          - "`docker build --build-arg NAME=value .` passes a build argument, and the `id` of a cache mount can be an argument: `id=$CACHE_ID`."
+          - "Print the file with `docker run --rm <image> cat /result` after each build."
+          - "Make the cache id unique per run -- a timestamp and the shell's process id are enough."
+        teach: |
+          The exercise separates two caches that are easy to confuse.
+
+          The **layer cache** belongs to the builder. An instruction whose
+          inputs have not changed is not run again; its layer is reused.
+          That is why the second build here passes a different `BUILD_ID`:
+          it changes the instruction's cache key, so the instruction runs
+          again, and what it sees is the state of the cache mount rather
+          than a cached result.
+
+          The **cache mount** belongs to the builder too, but it is keyed
+          by the mount's `id`, not by the instruction. Its contents are
+          carried from one build to the next, which is exactly what makes
+          a download cache worth having.
+
+          The `id` can be a build argument, which is what lets a CI job
+          choose a cache namespace per branch or per pipeline. It is also
+          why the exercise asks for a unique id: a fixed id would mean
+          that the second run of the exercise started with a warm cache,
+          and the first build would report `warm` instead of `cold`. A
+          cache is state on the machine, and state outlives the process
+          that created it.
+        tags: [buildkit, cli, optimisation]
+      - id: a-multi-stage-build
+        title: Build in one stage, ship from another
+        prompt: |
+          The image needs `/app/output.txt`, which a build step produces.
+          It also picks up `/usr/local/bin/buildtool`, which nothing needs
+          at run time, and it builds in `/build`.
+
+          Build the artefact in a separate stage and copy only the
+          artefact into the final image. The final image must not contain
+          the build tool, and must not contain the build directory.
+
+          The artefact is the single line `compiled artefact`. The image
+          must print it when it runs.
+        kind: image
+        entry_file: Dockerfile
+        files:
+          Dockerfile: |
+            # syntax=docker/dockerfile:1
+            FROM alpine:3.20
+
+            # Produce the artefact, and leave the build tool behind.
+
+            CMD ["sh", "-c", "echo built"]
+        solution:
+          Dockerfile: |
+            # syntax=docker/dockerfile:1
+            FROM alpine:3.20 AS builder
+
+            RUN mkdir -p /build && echo "compiled artefact" > /build/output.txt && \
+              echo "build tool" > /usr/local/bin/buildtool
+
+            FROM alpine:3.20
+
+            COPY --from=builder /build/output.txt /app/output.txt
+
+            CMD ["cat", "/app/output.txt"]
+        checks:
+          - name: the image prints the artefact
+            kind: default
+          - name: the build tool is not in the image
+            kind: run
+            command: test ! -e /usr/local/bin/buildtool && echo "not in the image"
+          - name: the build directory is not in the image
+            kind: run
+            command: test ! -e /build && echo "not in the image"
+        cases:
+          - name: the default run
+        hints:
+          - "Name a stage with `FROM alpine:3.20 AS builder`, then copy out of it with `COPY --from=builder /build/output.txt /app/output.txt`."
+          - "The final `FROM` starts the image that is actually built; everything before it is only used to produce files."
+          - "A multi-stage build needs the Dockerfile syntax line at the top."
+        teach: |
+          A multi-stage build is a build toolchain that is thrown away.
+          The first stage has everything needed to compile; the last stage
+          has only what the application needs to run. Because only the
+          final stage becomes the image, the compiler, the source tree and
+          the intermediate artefacts never reach it.
+
+          `COPY --from=builder` is how the artefact crosses the boundary.
+          The path on the left is a path in the named stage, and the path
+          on the right is a path in the final image. The two stages do not
+          share a filesystem; the copy is the only thing that passes
+          between them, and it passes exactly the files you name.
+
+          The stages are independent as far as the builder is concerned.
+          A stage that does not depend on another is built concurrently
+          with it, so a Dockerfile that builds a frontend and a backend
+          spends the time of the slower one rather than the sum of both.
+          The stages are also cached independently, which is why a change
+          to the final stage does not rebuild the builder stage.
+
+          The obvious cost is that the builder stage's image has to be
+          pulled and built too. That is why the builder stage is usually
+          the heavy base image (`golang:1.23`, `node:22`) and the final
+          stage is usually `alpine` or `distroless`.
+        tags: [multi-stage, buildkit, optimisation]
+      - id: a-cache-from
+        title: Declare a cache source for a build
+        prompt: |
+          Write a compose project with one service, `app`, that builds
+          from the project directory and reuses the layers of the
+          `alpine:3.20` image as a cache source, so that a rebuild does not
+          have to redo the base image's steps.
+
+          The project also needs a `Dockerfile`, which copies a file into
+          the image. Leave that file as it is.
+
+          The file must be called `compose.yaml`.
+        kind: compose
+        entry_file: compose.yaml
+        files:
+          "compose.yaml": |
+            # Your compose project here.
+            services:
+              app:
+                build:
+                  context: .
+          "hello.txt": |
+            hello from the cache demo
+          Dockerfile: |
+            FROM alpine:3.20
+
+            COPY hello.txt /app/hello.txt
+        solution:
+          "compose.yaml": |
+            services:
+              app:
+                build:
+                  context: .
+                  cache_from:
+                    - alpine:3.20
+          "hello.txt": |
+            hello from the cache demo
+          Dockerfile: |
+            FROM alpine:3.20
+
+            COPY hello.txt /app/hello.txt
+        checks:
+          - name: the project configuration
+            kind: config
+          - name: the built image works
+            kind: service
+            service: app
+            command: cat /app/hello.txt
+        cases:
+          - name: the default run
+        settings:
+          ignore_paths:
+            - services.app.command
+            - services.app.entrypoint
+        hints:
+          - "A cache source is a list of image references under the service's `build` section: `cache_from`."
+          - "On the command line the same thing is `docker build --cache-from alpine:3.20 .`."
+          - "The cache source is an image reference, not a path."
+        teach: |
+          `cache_from` is `--cache-from` written down in a compose file.
+          The builder is told it may take layers from these images when it
+          looks for a cached layer, in addition to whatever it already
+          has.
+
+          What it is good for is the case where the local cache is cold:
+          a fresh CI worker, a build that runs on a machine that has never
+          built this project, or a base image that was pulled rather than
+          built here. Without a cache source, that build re-runs every
+          step of the base image. With one, the layers are already there.
+
+          It is worth being clear about what it does not do. On a machine
+          that already has the layers in its own cache, `--cache-from`
+          changes nothing, because the builder would have reused them
+          anyway. And a cache source that cannot be reached is not an
+          error: the build simply does not reuse anything from it. That
+          makes it safe to list a registry reference that may not exist
+          yet.
+
+          The registry form is the one that pays off at scale, because it
+          moves the cache off the build machine:
+
+          ```bash
+          docker buildx build --cache-to type=registry,ref=myapp:cache .
+          docker buildx build --cache-from type=registry,ref=myapp:cache .
+          ```
+
+          The first command pushes the cache to a registry; the second
+          pulls it. That is how a build gets faster on the hundredth run
+          rather than on the second.
+        tags: [compose, buildkit, optimisation]
+  - id: a-reproducibility-and-pinning
+    title: Reproducibility and pinning
+    summary: Building the same thing twice, and building the same thing tomorrow.
+    body: |
+      # Reproducibility and pinning
+
+      A build that produces a different image every time is a build you
+      cannot reason about. "It worked yesterday" is not a debugging
+      strategy, and "it works now" is not a deployment.
+
+      ## Tags are pointers, digests are addresses
+
+      A tag is a mutable pointer to an image:
+
+      ```dockerfile
+      FROM alpine:3.20
+      ```
+
+      The tag `3.20` names whatever the registry says it names today.
+      Alpine publishes security fixes to old release branches, so the same
+      tag can point at different bytes on different days. Two machines
+      that run `docker pull alpine:3.20` on different days can end up with
+      different images under the same name.
+
+      A digest is the content's address:
+
+      ```dockerfile
+      FROM alpine:3.20@sha256:d9e853e87e55526f6b2917df91a2115c36dd7c696a35be12163d44e6e2a4b6bc
+      ```
+
+      The tag is still there, and still useful to a human reading the
+      file, but the build can only use the image with that exact digest.
+      If the tag is re-pushed, the build is unaffected.
+
+      > **Callout**
+      > `latest` is not a special value. It is an ordinary tag that
+      > happens to be the default, and it moves every time somebody
+      > publishes an image without a tag.
+
+      Pinning by digest has an obvious cost: you now have to update the
+      digest deliberately, which means somebody has to notice that the
+      base image was rebuilt. That is the point. The alternative is that
+      the change happens silently, in a rebuild you did not ask for.
+
+      ## Where the differences come from
+
+      Even with a pinned base image, two builds of the same Dockerfile can
+      produce different bytes:
+
+      - **The creation timestamp.** The image's configuration records when
+        it was built, and that is part of its identity.
+      - **File modification times.** A file created by a `RUN` is stamped
+        with the time the instruction ran, and those timestamps are part of
+        the layer's contents.
+      - **Whatever the build fetched.** A `RUN curl ...` downloads
+        something whose contents change without notice.
+
+      The first two are the build's own doing and can be pinned. The third
+      is a design problem: a build that reaches outside the build context
+      is not reproducible at all, because the outside is not pinned.
+
+      ## Pinning the timestamp
+
+      Docker has a standard build argument for this,
+      `SOURCE_DATE_EPOCH`, from the reproducible-builds project:
+
+      ```bash
+      docker build --build-arg SOURCE_DATE_EPOCH=1700000000 .
+      ```
+
+      The builder then uses that value as the image's creation time
+      instead of the wall clock. It is a build argument rather than an
+      `ENV` because it is an input to the build, not something the
+      application reads.
+
+      ## Why it matters
+
+      Reproducibility is what makes the rest of the tooling possible:
+
+      - **Content addressing.** If the build is deterministic -- the same
+        source and the same pinned inputs -- the image's digest is a
+        fingerprint of those inputs. A digest that changes means an input
+        changed.
+      - **Caching and diffing.** A registry can skip a push when the
+        digest is unchanged, and a deployment can skip a rollout when
+        nothing it runs has changed.
+      - **Auditing.** "Which version of this base image is this
+        application running on?" has to have an answer that does not
+        depend on when you ask.
+      - **Trust.** A build that can be reproduced from a source tree and a
+        list of pinned inputs can be verified by somebody who does not
+        trust the machine that built it.
+    exercises:
+      - id: a-pin-the-base-image
+        title: Pin the base image by digest
+        prompt: |
+          The image below is built from a tag, which means it is built from
+          whatever that tag points at today.
+
+          Pin it: the `FROM` instruction must refer to `alpine:3.20` *and*
+          its digest, so that a re-pushed tag cannot change what you
+          build.
+
+          The digest of the `alpine:3.20` image on this machine is
+          `sha256:d9e853e87e55526f6b2917df91a2115c36dd7c696a35be12163d44e6e2a4b6bc`.
+          The image must still print the Alpine release it is based on.
+        kind: image
+        entry_file: Dockerfile
+        files:
+          Dockerfile: |
+            # Your Dockerfile here.
+            FROM alpine:3.20
+
+            CMD ["cat", "/etc/alpine-release"]
+        solution:
+          Dockerfile: |
+            FROM alpine:3.20@sha256:d9e853e87e55526f6b2917df91a2115c36dd7c696a35be12163d44e6e2a4b6bc
+
+            CMD ["cat", "/etc/alpine-release"]
+        checks:
+          - name: the image prints the alpine release
+            kind: default
+          - name: the image has the base image's layers and nothing else
+            kind: inspect
+            template: "{{len .RootFS.Layers}}"
+        cases:
+          - name: the default run
+        settings:
+          require:
+            - "@sha256:"
+        hints:
+          - "A digest is written after the tag: `FROM alpine:3.20@sha256:...`."
+          - "The digest of an image you already have is in `docker image inspect alpine:3.20 --format '{{index .RepoDigests 0}}'`."
+          - "The tag and the digest can both be there. The tag is for the reader, the digest is for the builder."
+        teach: |
+          A tag and a digest answer different questions. The tag answers
+          "which release is this?" and the digest answers "which bytes?".
+          Keeping the tag in the file means a human can still read what
+          the base image is; the digest means the build cannot silently
+          pick up different bytes.
+
+          The cost of pinning is real and worth stating plainly: security
+          updates to the base image now require a commit that changes the
+          digest. That is a chore, and it is the chore. The alternative
+          is that the change happens at a moment of your choosing, without
+          a review, in a rebuild nobody was watching.
+
+          The check on the layer count is a reminder that pinning does not
+          change what is built -- the same base image, the same single
+          layer -- it only changes which copy of it is allowed.
+
+          This is why `latest` never appears in a Dockerfile anyone means to
+          ship. It is an ordinary tag that moves, and it is the tag that
+          `docker build` uses when you do not say otherwise.
+        tags: [reproducibility, dockerfile, images]
+      - id: a-fixed-build-timestamp
+        title: Stop stamping the wall clock into the image
+        prompt: |
+          The image records when it was built, in `/app/built-at`. Right now
+          it records the time the build ran, which means every build of
+          this image is different from every other one.
+
+          The grader builds your image with the build argument
+          `SOURCE_DATE_EPOCH=1700000000`. Make the image record *that*
+          value instead of the current time: the file must contain the
+          value and nothing else.
+
+          A build argument has to be declared before it can be used.
+        kind: image
+        entry_file: Dockerfile
+        files:
+          Dockerfile: |
+            # Your Dockerfile here.
+            FROM alpine:3.20
+
+            RUN mkdir -p /app && date > /app/built-at
+
+            CMD ["sh", "-c", "echo built"]
+        solution:
+          Dockerfile: |
+            FROM alpine:3.20
+
+            ARG SOURCE_DATE_EPOCH
+
+            RUN mkdir -p /app && echo "$SOURCE_DATE_EPOCH" > /app/built-at
+
+            CMD ["sh", "-c", "echo built"]
+        checks:
+          - name: the image records the pinned timestamp
+            kind: run
+            command: cat /app/built-at
+          - name: the image records the pinned creation time
+            kind: inspect
+            template: "{{.Created}}"
+        cases:
+          - name: the default run
+            build_args:
+              SOURCE_DATE_EPOCH: "1700000000"
+        hints:
+          - "A build argument is declared with `ARG` and used like an environment variable inside `RUN`."
+          - "`ARG SOURCE_DATE_EPOCH` without a default takes the value the builder passes with `--build-arg`."
+          - "Put the value in a file with `RUN mkdir -p /app && echo \"$SOURCE_DATE_EPOCH\" > /app/built-at`."
+        teach: |
+          `ARG` declares a value that exists during the build and does not
+          survive into the running container unless you turn it into an
+          `ENV`. That is exactly what you want for a build input: the
+          builder uses it, the application never sees it, and it is not in
+          the image's configuration.
+
+          `SOURCE_DATE_EPOCH` is the convention the reproducible-builds
+          project settled on, and Docker implements it in two places. The
+          image's creation timestamp is taken from it, which is what the
+          second check looks at -- and the second check is worth reading
+          carefully: the *same* argument value produces the same creation
+          timestamp on every machine, which is what makes an image's
+          identity a function of its inputs rather than of the day it was
+          built.
+
+          Writing the value into a file is the other half of the habit.
+          A file created by a `RUN` carries the wall-clock time in its
+          modification time, and that timestamp is part of the layer's
+          bytes, so two builds of the same Dockerfile produce different
+          layers. Recording the pinned epoch in a file instead of the
+          current time removes the wall clock from the contents as well as
+          from the metadata.
+
+          A build argument also belongs in the build's cache key, so
+          changing it invalidates the layers that use it. That is a
+          feature: a different epoch means a different image, and the
+          builder should not hand you the old one.
+        tags: [reproducibility, config, layers]
+      - id: a-two-builds-one-source
+        title: Build the same source twice
+        prompt: |
+          A `Dockerfile` is in this exercise. Build the image twice, with
+          `--no-cache` so that neither build reuses anything from the
+          other, and print whether the two images have the same identity.
+
+          Print `same` if they do and `different` if they do not.
+        kind: cli
+        entry_file: solve.sh
+        files:
+          "solve.sh": |
+            # Your commands here.
+          Dockerfile: |
+            FROM alpine:3.20
+
+            RUN echo "hello" > /app.txt
+
+            CMD ["cat", "/app.txt"]
+        solution:
+          "solve.sh": |
+            docker build --no-cache -t trainer-repro-a:1 . >/dev/null 2>&1
+            docker build --no-cache -t trainer-repro-b:1 . >/dev/null 2>&1
+
+            a=$(docker image inspect --format '{{.Id}}' trainer-repro-a:1)
+            b=$(docker image inspect --format '{{.Id}}' trainer-repro-b:1)
+
+            if [ "$a" = "$b" ]; then
+              echo "same"
+            else
+              echo "different"
+            fi
+          Dockerfile: |
+            FROM alpine:3.20
+
+            RUN echo "hello" > /app.txt
+
+            CMD ["cat", "/app.txt"]
+        setup:
+          - "docker image rm -f trainer-repro-a:1 trainer-repro-b:1"
+        teardown:
+          - "docker image rm -f trainer-repro-a:1 trainer-repro-b:1"
+        checks:
+          - name: the script's output
+            kind: script
+            command: sh solve.sh
+        cases:
+          - name: the default run
+        hints:
+          - "`docker image inspect --format '{{.Id}}' <image>` prints the image's identity, which is a digest of its configuration."
+          - "Two builds need two tags, and `--no-cache` stops the second one from being served out of the cache."
+          - "Compare the two ids and print `same` or `different`."
+        teach: |
+          An image's identity is a digest of its configuration, and the
+          configuration includes the moment the image was created. Two
+          builds that run a second apart produce two different
+          identities, even when every file in them is byte for byte
+          identical. That is why `--no-cache` is in the exercise: with the
+          cache, the second build is not a build at all -- it is the first
+          build's result handed back, and the two images are trivially the
+          same.
+
+          The layers are different too, and for a related reason. A file
+          created by a `RUN` is stamped with the time the instruction ran,
+          and those timestamps are part of the layer's contents, so the
+          layer digests differ between two fresh builds.
+
+          Neither of these is a defect. They are the reason the
+          reproducible-builds conventions exist: `SOURCE_DATE_EPOCH` pins
+          the creation time, and a build that copies from the context
+          rather than generating files removes the second source of
+          variation. Once both are done, the same source and the same
+          pinned inputs produce the same digest on any machine, and the
+          digest becomes a fingerprint you can compare, cache on, and
+          audit.
+        tags: [reproducibility, cli, operations]
+      - id: a-hermetic-build
+        title: Build only from what is in the context
+        prompt: |
+          The image below fetches its data over the network during the
+          build. That makes the build depend on a third party, on the
+          network, and on the remote file not changing.
+
+          Rewrite it so that everything the image needs comes from the
+          build context, and nothing is downloaded during the build.
+
+          The image must print the contents of `/app/data.txt`.
+        kind: image
+        entry_file: Dockerfile
+        files:
+          "data.txt": |
+            release=1.0.0
+          Dockerfile: |
+            # Your Dockerfile here.
+            FROM alpine:3.20
+
+            ADD https://example.invalid/data.txt /app/data.txt
+
+            CMD ["cat", "/app/data.txt"]
+        solution:
+          "data.txt": |
+            release=1.0.0
+          Dockerfile: |
+            FROM alpine:3.20
+
+            WORKDIR /app
+
+            COPY data.txt /app/data.txt
+
+            CMD ["cat", "/app/data.txt"]
+        checks:
+          - name: the image prints the data
+            kind: default
+          - name: the data is in the image
+            kind: run
+            command: cat /app/data.txt
+        cases:
+          - name: the default run
+        settings:
+          forbid:
+            - "curl"
+            - "wget"
+            - "add http"
+        hints:
+          - "`COPY` reads a file from the build context; `ADD` can also fetch a URL, which is what you are removing."
+          - "The file `data.txt` is already in the build context, so `COPY data.txt /app/data.txt` is enough."
+          - "`WORKDIR /app` sets the working directory and makes the copy path shorter."
+        teach: |
+          A build that reaches outside its context is not reproducible and
+          not verifiable, for the same reason: the outside is not pinned.
+          A remote file can change, a package index can move, a DNS name
+          can point somewhere else. The build is then a function of the
+          world rather than of its inputs, and two builds of the same
+          source can differ.
+
+          `COPY` and `ADD` look similar and are not. `COPY` copies from
+          the build context. `ADD` can also fetch a URL, and it untars
+          local archives. The URL form of `ADD` is deprecated for exactly
+          this reason: it makes the build depend on the network and on a
+          resource nobody is reviewing.
+
+          Pinning a dependency is the harder version of the same
+          discipline. `apk add curl` fetches whatever the repository
+          currently serves; `apk add curl=8.9.0` fetches a specific
+          version, and the version has to be one that exists. The
+          trade-off is the usual one: pinned inputs mean updates are a
+          deliberate act, and unpinned inputs mean every build is a small
+          bet that the world has not moved.
+
+          The rules are enforced here rather than merely advised. The
+          exercise rejects a Dockerfile that mentions `curl`, `wget` or a
+          remote `ADD`, because a build that can reach out is a build that
+          can surprise you.
+        tags: [reproducibility, dockerfile, security]
+  - id: a-resource-limits-and-hardening
+    title: Resource limits and hardening
+    summary: What a container is allowed to use, and what it is allowed to do.
+    body: |
+      # Resource limits and hardening
+
+      A container with no limits is a container that can take the machine
+      down, and a container with every capability is a container that can
+      take itself down.
+
+      ## Limits
+
+      `docker run` takes four limits that matter:
+
+      ```bash
+      docker run --memory 256m --cpus 1.5 --pids-limit 100 myapp:1
+      ```
+
+      | Flag | Limit | What happens when it is hit |
+      | --- | --- | --- |
+      | `--memory` | the container's memory | the kernel's out-of-memory killer stops a process in the container |
+      | `--cpus` | the container's CPU time | the cgroup throttles the container to the quota |
+      | `--pids-limit` | the number of processes | `fork` fails with "Resource temporarily unavailable" |
+      | `--memory-swap` | memory plus swap | usually set equal to `--memory` to disable swap |
+
+      The PID limit is the one people forget, and it is the one that
+      catches a fork bomb: the processes stay inside the container's pid
+      namespace, so the limit stops them before the host runs out of
+      process table.
+
+      The daemon records what it was asked for, which is worth knowing
+      because it is how you check that a limit is actually in force:
+
+      ```bash
+      docker inspect --format '{{.HostConfig.Memory}}' my-container
+      ```
+
+      In compose, the same limits are declared rather than passed:
+
+      ```yaml
+      services:
+        web:
+          image: myapp:1
+          deploy:
+            resources:
+              limits:
+                memory: 256M
+                cpus: "1.5"
+                pids: 100
+      ```
+
+      ## A read-only root filesystem
+
+      An application that writes to its own filesystem is an application
+      that can be surprised by its own filesystem. `read_only: true` in
+      compose, `--read-only` on the command line, makes the container's
+      root filesystem immutable:
+
+      ```yaml
+      services:
+        web:
+          image: myapp:1
+          read_only: true
+          tmpfs:
+            - /tmp
+      ```
+
+      The `tmpfs` is not optional decoration. A read-only root
+      filesystem with no writable space anywhere breaks half the
+          software in the world, because temporary files are normal.
+
+      ## Capabilities
+
+      The fourteen capabilities Docker grants by default are more than an
+          application needs. Dropping them is cheap:
+
+      ```yaml
+      services:
+        web:
+          image: myapp:1
+          cap_drop:
+            - ALL
+          security_opt:
+            - no-new-privileges:true
+      ```
+
+      `cap_drop: [ALL]` leaves the process with no capabilities at all.
+      `no-new-privileges` stops the process from gaining any back, which
+      closes the door on setuid binaries: even if something in the image is
+      marked setuid root, the kernel will not honour it.
+
+      You can check the result from inside the container:
+
+      ```bash
+      grep CapEff /proc/self/status
+      grep NoNewPrivs /proc/self/status
+      ```
+
+      ## The order of the checklist
+
+      These controls are not independent, and they are most useful in a
+      particular order:
+
+      1. **Run as a non-root user.** The other controls are about
+         restricting what a process may do; a process that is already
+         unprivileged has much less to restrict.
+      2. **Drop the capabilities it does not need.**
+      3. **Make the filesystem read-only**, and give it a `tmpfs` for the
+         places that genuinely need to be written.
+      4. **Set the resource limits**, so that a bug in the application
+         costs a container restart rather than a machine outage.
+    exercises:
+      - id: a-resource-limits
+        title: Set memory, CPU and process limits
+        prompt: |
+          Write a compose project with one service, `web`, that runs
+          `alpine:3.20` and declares its limits: 128 MB of memory, half a
+          CPU, and 64 processes.
+
+          The limits have to be in force when the container runs, not just
+          written down.
+
+          The file must be called `compose.yaml`.
+        kind: compose
+        entry_file: compose.yaml
+        files:
+          "compose.yaml": |
+            # Your compose project here.
+            services:
+              web:
+                image: alpine:3.20
+        solution:
+          "compose.yaml": |
+            services:
+              web:
+                image: alpine:3.20
+                deploy:
+                  resources:
+                    limits:
+                      memory: 128M
+                      cpus: "0.50"
+                      pids: 64
+        checks:
+          - name: the project configuration
+            kind: config
+          - name: the memory limit is in force
+            kind: service
+            service: web
+            command: cat /sys/fs/cgroup/memory.max
+          - name: the process limit is in force
+            kind: service
+            service: web
+            command: cat /sys/fs/cgroup/pids.max
+        cases:
+          - name: the default run
+        settings:
+          ignore_paths:
+            - services.web.command
+            - services.web.entrypoint
+        hints:
+          - "The limits live under the service's `deploy.resources.limits`, with the keys `memory`, `cpus` and `pids`."
+          - "`memory` takes a size with a unit (`128M`), `cpus` takes a fraction of a core as a string, and `pids` takes a number."
+          - "The cgroup files under `/sys/fs/cgroup` show the limits that are actually in force."
+        teach: |
+          A limit that is not enforced is a comment. The check here reads
+          the container's cgroup files, which is the kernel's own view of
+          what the process is allowed to do -- the same numbers the
+          out-of-memory killer and the fork handler use.
+
+          The three limits fail differently, which is worth knowing before
+          you need it:
+
+          - A memory limit is enforced by killing. When the container goes
+            over its limit, the kernel's out-of-memory killer picks a
+            process in the cgroup and kills it. The container does not
+            exit cleanly; the process just disappears, usually with exit
+            code 137.
+          - A CPU limit is enforced by throttling. The cgroup gives the
+            container a quota per period -- "half a core" means 50,000
+            microseconds of CPU time per 100,000-microsecond period -- and
+            the process is stopped when it uses it up. The symptom is
+            latency, not a crash.
+          - A PID limit is enforced by refusing. `fork` returns
+            `EAGAIN`, and a shell that is forking in a loop reports
+            "Resource temporarily unavailable". This is the limit that
+            stops a fork bomb, and it is the one that turns a runaway
+            application into a failed `fork` instead of a dead host.
+
+          Compose's `deploy.resources.limits` is the modern spelling.
+          Docker Swarm has always used it, and `docker compose` applies
+          the same limits to a local project.
+        tags: [compose, limits, operations]
+      - id: a-read-only-root-filesystem
+        title: Make the root filesystem read-only
+        prompt: |
+          The `web` service writes temporary files. Make its root
+          filesystem read-only, and give it a writable `/tmp` so that the
+          temporary files still work.
+
+          The container must not be able to write to the root filesystem,
+          and must be able to write to `/tmp`.
+
+          The file must be called `compose.yaml`.
+        kind: compose
+        entry_file: compose.yaml
+        files:
+          "compose.yaml": |
+            # Your compose project here.
+            services:
+              web:
+                image: alpine:3.20
+        solution:
+          "compose.yaml": |
+            services:
+              web:
+                image: alpine:3.20
+                read_only: true
+                tmpfs:
+                  - /tmp
+        checks:
+          - name: the project configuration
+            kind: config
+          - name: the root filesystem is read-only
+            kind: service
+            service: web
+            command: touch /root/nope 2>/dev/null || echo "read-only"
+          - name: the temporary directory is writable
+            kind: service
+            service: web
+            command: touch /tmp/scratch && echo writable
+        cases:
+          - name: the default run
+        settings:
+          ignore_paths:
+            - services.web.command
+            - services.web.entrypoint
+        hints:
+          - "The service key is `read_only: true`."
+          - "A `tmpfs` is a small in-memory filesystem; the service key is `tmpfs`, with the paths as a list."
+          - "Without the tmpfs, a read-only root filesystem breaks anything that writes a temporary file."
+        teach: |
+          A writable root filesystem is a convenience that costs more than
+          it looks like. It means the container's filesystem is a place
+          where an application can put anything, that the state of the
+          container drifts away from the state of the image, and that
+          investigating a running container means comparing two filesystems
+          rather than one.
+
+          `read_only: true` removes the option. The container's root
+          filesystem becomes immutable, and an application that tries to
+          write to it gets `EROFS` rather than silently accumulating
+          state.
+
+          The `tmpfs` is the other half of the answer, and it is not
+          optional. Temporary files are normal: a compiler writing object
+          files, a library writing a PID file, an application writing a
+          scratch file, `/dev/shm` being too small. A tmpfs is a small
+          in-memory filesystem mounted at a path, so the container gets a
+          writable place without the writable place being part of the
+          image or of the container's persistent state. Its contents
+          disappear when the container goes away, which is usually what you
+          wanted anyway.
+
+          The size of the tmpfs is worth setting explicitly if the
+          application writes more than a few megabytes: an unbounded
+          tmpfs is memory the container can use without the memory limit
+          noticing.
+        tags: [compose, limits, security]
+      - id: a-drop-capabilities
+        title: Drop the capabilities the application does not need
+        prompt: |
+          The `web` service does not need any capability at all. Take them
+          all away, and make sure the process can never gain a privilege
+          back.
+
+          The file must be called `compose.yaml`.
+        kind: compose
+        entry_file: compose.yaml
+        files:
+          "compose.yaml": |
+            # Your compose project here.
+            services:
+              web:
+                image: alpine:3.20
+        solution:
+          "compose.yaml": |
+            services:
+              web:
+                image: alpine:3.20
+                cap_drop:
+                  - ALL
+                security_opt:
+                  - no-new-privileges:true
+        checks:
+          - name: the project configuration
+            kind: config
+          - name: the process has no capabilities
+            kind: service
+            service: web
+            command: grep CapEff /proc/self/status
+          - name: the process cannot gain privileges
+            kind: service
+            service: web
+            command: grep NoNewPrivs /proc/self/status
+        cases:
+          - name: the default run
+        settings:
+          ignore_paths:
+            - services.web.command
+            - services.web.entrypoint
+            - services.web.cap_drop
+            - services.web.security_opt
+        hints:
+          - "`cap_drop` takes a list of capability names; the list `[ALL]` removes every one of them."
+          - "`no-new-privileges` is a `security_opt` entry, and it is written as `no-new-privileges:true`."
+          - "`/proc/self/status` reports the process's capabilities in `CapEff` and the `no-new-privileges` flag in `NoNewPrivs`."
+        teach: |
+          Capabilities are the modern answer to "what may this process
+          do". Before them, the answer was a uid: root could do
+          everything, everybody else could do nothing. Capabilities split
+          that up, and Docker hands a container fourteen of them by
+          default: `CHOWN`, `DAC_OVERRIDE`, `FOWNER`, `FSETID`, `KILL`,
+          `SETGID`, `SETUID`, `SETPCAP`, `NET_BIND_SERVICE`, `NET_RAW`,
+          `SYS_CHROOT`, `MKNOD`, `AUDIT_WRITE` and `SETFCAP`.
+
+          Most applications need none of them. A web server that reads
+          files and opens a socket needs `NET_BIND_SERVICE` only if it
+          binds a port below 1024, and nothing else. So the default is
+          dropped wholesale with `cap_drop: [ALL]`, and a specific
+          capability is added back with `cap_add` if the application
+          turns out to need one.
+
+          `no-new-privileges` is a different mechanism and complements the
+          drop rather than replacing it. It sets a flag in the process's
+          credentials that says the kernel must never grant the process a
+          privilege it did not already have. That closes off the setuid
+          route: a binary in the image marked setuid root is simply
+          ignored, because the process is not allowed to become more
+          privileged than it already is.
+
+          `CapEff` and `NoNewPrivs` in `/proc/self/status` are the
+          kernel's own report on what the process ended up with, which
+          makes them a better check than the configuration: they describe
+          the result rather than the intention.
+        tags: [compose, security, limits]
+      - id: a-runtime-limits
+        title: Ask for limits on the command line
+        prompt: |
+          Write a script that starts a container with a memory limit of 64
+          MB, a CPU limit of half a core, and a limit of 32 processes, and
+          then prints the three limits the daemon recorded:
+
+          1. the memory limit, in bytes;
+          2. the CPU limit, in nano-CPUs;
+          3. the PID limit.
+
+          One per line, in that order. The container should be removed
+          again when you are done with it.
+        kind: cli
+        entry_file: solve.sh
+        files:
+          "solve.sh": |
+            # Your commands here.
+        solution:
+          "solve.sh": |
+            docker run -d --name trainer-a-limits --memory 64m --cpus 0.5 --pids-limit 32 alpine:3.20 sleep 30 >/dev/null
+            docker inspect --format '{{.HostConfig.Memory}}' trainer-a-limits
+            docker inspect --format '{{.HostConfig.NanoCpus}}' trainer-a-limits
+            docker inspect --format '{{.HostConfig.PidsLimit}}' trainer-a-limits
+            docker rm -f trainer-a-limits >/dev/null
+        setup:
+          - "docker rm -f trainer-a-limits"
+        teardown:
+          - "docker rm -f trainer-a-limits"
+        checks:
+          - name: the script's output
+            kind: script
+            command: sh solve.sh
+        cases:
+          - name: the default run
+        hints:
+          - "The flags are `--memory`, `--cpus` and `--pids-limit`; run the container detached with `-d` so the script can carry on."
+          - "The daemon records the limits on the container: `docker inspect --format '{{.HostConfig.Memory}}' <name>`."
+          - "The memory limit is stored in bytes and the CPU limit in nano-CPUs, so a second is a thousand million of them."
+        teach: |
+          The command line and the compose file set the same limits; this
+          is the command line version.
+
+          The units are worth reading carefully, because the daemon stores
+          integers and the interface is what converts them. `--memory 64m`
+          is 64 mebibytes and is stored as 67108864 bytes. `--cpus 0.5` is
+          half of one core and is stored as 500000000 nano-CPUs, because
+          the CPU quota is a number of nanoseconds of CPU time per
+          scheduling period. `--pids-limit 32` is stored as 32.
+
+          Reading the recorded values back is the check that the limit was
+          actually applied, rather than merely requested. A typo in a flag
+          name is silently ignored by `docker run` -- the container starts
+          happily with no limit at all -- so "the flag is in my command
+          line" and "the limit is in force" are different claims, and only
+          the second one matters.
+
+          The values also show what the limits mean for a scheduler. A
+          memory limit is a hard ceiling: over it, a process is killed. A
+          CPU limit is a share: over it, the container is throttled and
+          the latency shows up in the response times rather than in the
+          logs. A PID limit is a hard ceiling too, and the failure is a
+          `fork` that returns `EAGAIN`.
+        tags: [cli, limits, operations]

@@ -1,0 +1,128 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Learn · Docker Trainer</title>
+<link rel="stylesheet" href="/css/app.css">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><text y='26' font-size='26'>🐳</text></svg>">
+</head>
+<body>
+<header data-nav></header>
+
+<main class="wrap">
+  <div class="section-head" style="margin-top:32px">
+    <h1 style="margin:0">Learn</h1>
+    <span class="sub">Read the lesson, then work the exercises.</span>
+  </div>
+
+  <div class="filters">
+    <select id="track-filter">
+      <option value="">All tracks</option>
+    </select>
+  </div>
+
+  <div id="content">
+    <div class="empty"><span class="spinner"></span> Loading lessons...</div>
+  </div>
+
+  <footer data-footer></footer>
+</main>
+
+<script type="module">
+import { api } from '/js/api.js';
+import { mountNav, mountFooter, loading, failure } from '/js/layout.js';
+import { mountMarkdown } from '/js/markdown.js';
+import { el, mount, statusBadge } from '/js/dom.js';
+
+mountNav();
+mountFooter();
+
+const content = document.getElementById('content');
+const trackFilter = document.getElementById('track-filter');
+
+let tracks = [];
+
+loading(content, 'Loading lessons...');
+try {
+  const data = await api.curriculum();
+  tracks = data.tracks;
+
+  for (const track of tracks) {
+    trackFilter.append(el('option', { value: track.id }, `${track.title} (${track.exercise_count})`));
+  }
+  const requested = new URLSearchParams(location.search).get('track');
+  if (requested && tracks.some((t) => t.id === requested)) trackFilter.value = requested;
+
+  trackFilter.addEventListener('change', () => {
+    const url = new URL(location);
+    url.searchParams.delete('track');
+    if (trackFilter.value) url.searchParams.set('track', trackFilter.value);
+    history.replaceState(null, '', url);
+    render();
+  });
+
+  render();
+} catch (error) {
+  failure(content, error);
+}
+
+function render() {
+  const visible = tracks.filter((t) => !trackFilter.value || t.id === trackFilter.value);
+  mount(content, visible.map(renderTrack));
+}
+
+function renderTrack(track) {
+  return el('section', { style: 'margin-bottom:40px' }, [
+    el('div', { class: 'section-head' }, [
+      el('h2', { style: 'margin:0' }, track.title),
+      el('span', { class: 'sub' }, [
+        el('span', { class: `badge ${track.difficulty}`, text: track.difficulty }),
+        ` ${track.exercise_count} exercises`,
+      ]),
+    ]),
+    el('p', { style: 'color:var(--text-muted);max-width:70ch' }, track.description),
+    el('div', { style: 'margin-top:18px' }, track.lessons.map(renderLesson)),
+  ]);
+}
+
+function renderLesson(lesson) {
+  const done = lesson.exercises.filter((ex) => ex.status === 'solved').length;
+  return el('details', { class: 'card', style: 'margin-bottom:12px;padding:0' }, [
+    el('summary', { style: 'padding:16px 20px;cursor:pointer;list-style:none;display:flex;align-items:center;gap:12px' }, [
+      el('span', { style: 'font-weight:600' }, lesson.title),
+      el('span', { style: 'color:var(--text-muted);font-size:.85rem;flex:1' }, lesson.summary),
+      el('span', { class: 'badge' }, `${done}/${lesson.exercise_count} solved`),
+    ]),
+    // Body is hidden until opened: rendering every lesson's markdown up front
+    // makes the page noticeably slow on a slow machine.
+    el('div', { class: 'prose', style: 'padding:0 20px 8px', 'data-lesson': lesson.id }, []),
+    el('div', { style: 'padding:0 20px 20px' }, lesson.exercises.map((ex) => renderExercise(ex))),
+  ]);
+}
+
+// Lazily render the lesson text the first time its details is opened.
+content.addEventListener('toggle', (event) => {
+  const details = event.target;
+  if (!details.matches('details.card') || !details.open) return;
+  const prose = details.querySelector('.prose');
+  const lessonId = prose.dataset.lesson;
+  if (!lessonId || prose.dataset.loaded) return;
+  prose.dataset.loaded = '1';
+  api.lesson(lessonId)
+    .then((lesson) => mountMarkdown(prose, lesson.body))
+    .catch((error) => mount(prose, el('p', { class: 'banner error' }, error.message)));
+}, true);
+
+function renderExercise(exercise) {
+  return el('a', { class: 'ex-row', href: `/exercise.html?id=${encodeURIComponent(exercise.id)}` }, [
+    el('span', { text: exercise.title }),
+    el('span', { class: 'meta' }, [
+      exercise.attempts ? el('span', { text: `${exercise.attempts} attempt${exercise.attempts === 1 ? '' : 's'}` }) : null,
+      statusBadge(exercise.status),
+    ]),
+  ]);
+}
+</script>
+</body>
+</html>

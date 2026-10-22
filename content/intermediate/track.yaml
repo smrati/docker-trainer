@@ -1,0 +1,2318 @@
+id: intermediate
+title: Intermediate
+description: >-
+  Build images that are small enough to ship and Compose projects that are
+  worth running. Multi-stage builds, layer and cache hygiene, service
+  networking, and the CLI you reach for when something is already running.
+difficulty: intermediate
+order: 2
+lessons:
+  - id: i-multi-stage-builds
+    title: Multi-stage builds
+    summary: >-
+      Build in one image, ship from another, and keep the toolchain out of
+      the artefact you deploy.
+    body: |
+      # Multi-stage builds
+
+      A Dockerfile is a list of instructions, and every instruction that
+      touches the filesystem adds a layer. That is fine when the layers are
+      the things you ship. It is a problem when the layers are the things you
+      needed only to *build* the thing you ship.
+
+      ## Stages
+
+      A **stage** is a section of a Dockerfile that starts with `FROM` and
+      ends at the next `FROM`.
+
+      ```dockerfile
+      FROM alpine:3.20 AS builder
+      RUN apk add --no-cache make
+      RUN make -C /src -o /out/app
+
+      FROM alpine:3.20
+      COPY --from=builder /out/app /usr/local/bin/app
+      CMD ["app"]
+      ```
+
+      The `AS builder` part gives the stage a name. The name is what lets a
+      later stage say "take this file from that stage" instead of "take this
+      file from the build context".
+
+      > **Callout**
+      > Only the **last** stage in the file becomes the image. Everything
+      > before it is a build-time convenience that never ships. Writing the
+      > runtime stage first is a common way to end up shipping the compiler.
+
+      ## Why the final image is smaller
+
+      In a single-stage build, the compiler, the package index, the source
+      tree and the object files all end up in the same image. Deleting them
+      afterwards does not help: `rm` in a later layer only *hides* the files,
+      the bytes are still in the layer underneath.
+
+      A second stage gives you somewhere else to put the mess. The build
+      happens in `builder`; only the artefact is copied into the final stage.
+      The final image contains the artefact and nothing else.
+
+      ```dockerfile
+      COPY --from=builder /out/app /usr/local/bin/app
+      ```
+
+      Two things about the paths are worth knowing:
+
+      * The source is a path **inside the named stage**, not in the build
+        context.
+      * When the source is a directory, Docker copies its **contents**, not
+        the directory itself. `COPY --from=builder /build/tools /app` puts
+        `tcc` at `/app/tcc`. To keep the directory, copy its parent:
+        `COPY --from=builder /build /app` puts it at `/app/tools/tcc`.
+
+      ## Build arguments and stages
+
+      An `ARG` is scoped to the stage that declares it. A build argument
+      declared in the builder stage is invisible in the final stage, and the
+      other way round. Declare an argument where you use it.
+
+      ```dockerfile
+      FROM alpine:3.20 AS builder
+      ARG VERSION=dev            # scoped to this stage
+      RUN echo "$VERSION" > /build/version.txt
+
+      FROM alpine:3.20
+      COPY --from=builder /build/version.txt /version.txt
+      ```
+
+      An `ARG` declared *before* the first `FROM` is global. It is the only
+      way to parameterise a base image, and it is not visible inside a stage
+      until that stage re-declares it.
+
+      ```dockerfile
+      ARG ALPINE_VERSION=3.20
+      FROM alpine:${ALPINE_VERSION} AS builder
+      ARG APP_VERSION             # picks up --build-arg APP_VERSION=...
+      RUN echo "$APP_VERSION" > /build/version.txt
+      ```
+
+      ## What the earlier stages cost
+
+      The stages you do not ship are not free. Each one is a directory in the
+      build cache, and the copy step between stages is a real copy of real
+      bytes. A build stage that compiles a large tree can take longer and
+      use more disk than the runtime image ever will. That is usually the
+      right trade: the build happens once, on a machine you control, and the
+      image is shipped thousands of times.
+    exercises:
+      - id: i-multi-stage-last-stage
+        title: Put the runtime stage last
+        prompt: |
+          A Dockerfile can have several stages, and only the **last** one
+          becomes the image. The stages before it are used for building and
+          thrown away.
+
+          The Dockerfile below has two stages, but the runtime stage is
+          written first, so the image that comes out is the build stage --
+          which is why the app's file is missing from it.
+
+          Reorder the stages so that the image contains the app, and nothing
+          from the build stage.
+        kind: image
+        entry_file: Dockerfile
+        files:
+          app.txt: |
+            hello from the app
+          Dockerfile: |
+            # Two stages. Only the last one becomes the image, so this file
+            # currently ships the build stage.
+            FROM alpine:3.20 AS runtime
+            WORKDIR /app
+            COPY app.txt /app/app.txt
+            CMD ["cat", "/app/app.txt"]
+
+            FROM alpine:3.20 AS build
+            RUN echo "this is the build stage" > /build.txt
+            CMD ["cat", "/build.txt"]
+        solution:
+          app.txt: |
+            hello from the app
+          Dockerfile: |
+            FROM alpine:3.20 AS build
+            RUN echo "this is the build stage" > /build.txt
+
+            FROM alpine:3.20 AS runtime
+            WORKDIR /app
+            COPY app.txt /app/app.txt
+            CMD ["cat", "/app/app.txt"]
+        checks:
+          - name: the image contains the app
+            kind: run
+            command: cat /app/app.txt
+          - name: the image does not contain the build stage output
+            kind: run
+            command: test ! -e /build.txt && echo "no build stage in the image"
+        cases:
+          - name: the default build
+        hints:
+          - "The image is the **last** stage in the file, whatever the stages are called."
+          - "Move the runtime stage below the build stage. The order of the stages is what decides which one ships."
+          - "The `AS runtime` and `AS build` labels are optional, but they are what makes the file readable."
+        teach: |
+          Docker builds every stage in the file, in order, and then throws
+          away all but the last one. The earlier stages are still useful --
+          they are how you build something without shipping the tools you
+          built it with -- but their contents never reach the image.
+
+          This is the first thing to check when a multi-stage Dockerfile
+          produces the wrong image: is the stage you meant to ship actually
+          the last one? A `FROM` line ends the previous stage, so the order
+          of the `FROM` lines is the order of the stages.
+
+          The build stage still costs something: it is a directory in the
+          build cache and it is built on every clean build. What it does not
+          cost is image size, and that is the trade most multi-stage builds
+          are making.
+        tags: [multi-stage, dockerfile, images]
+      - id: i-multi-stage-toolchain
+        title: Keep the toolchain out of the image
+        prompt: |
+          This image builds an artefact with a small "toolchain" and then
+          ships everything: the toolchain, the build directory and the
+          artefact.
+
+          Split the Dockerfile into two stages so that the image contains
+          only the artefact. The toolchain is build-time only and must not
+          appear in the final image -- not even as a leftover file.
+        kind: image
+        entry_file: Dockerfile
+        files:
+          Dockerfile: |
+            # One stage, so the toolchain ships with the artefact.
+            FROM alpine:3.20
+
+            RUN mkdir -p /toolchain \
+             && printf '#!/bin/sh\necho "artefact v1"\n' > /toolchain/tcc \
+             && chmod +x /toolchain/tcc
+
+            RUN mkdir -p /build && /toolchain/tcc > /build/artefact.txt
+
+            RUN mkdir -p /app && cp /build/artefact.txt /app/artefact.txt
+
+            CMD ["cat", "/app/artefact.txt"]
+        solution:
+          Dockerfile: |
+            FROM alpine:3.20 AS builder
+
+            RUN mkdir -p /toolchain \
+             && printf '#!/bin/sh\necho "artefact v1"\n' > /toolchain/tcc \
+             && chmod +x /toolchain/tcc
+
+            RUN mkdir -p /build && /toolchain/tcc > /build/artefact.txt
+
+            FROM alpine:3.20
+
+            COPY --from=builder /build/artefact.txt /app/artefact.txt
+
+            CMD ["cat", "/app/artefact.txt"]
+        checks:
+          - name: the image contains the artefact
+            kind: run
+            command: cat /app/artefact.txt
+          - name: the image does not contain the toolchain
+            kind: run
+            command: test ! -e /toolchain/tcc && echo "toolchain excluded"
+        cases:
+          - name: the default build
+        hints:
+          - "Name the first stage with `FROM alpine:3.20 AS builder`, then start a second `FROM` for the image you ship."
+          - "The second stage copies the artefact across with `COPY --from=builder /build/artefact.txt /app/artefact.txt`."
+          - "Docker creates the destination directory for you, so `/app` does not have to exist first."
+        teach: |
+          A layer is a diff against the layer below it. Deleting a file in a
+          later layer adds a *whiteout* to that layer; the original bytes
+          are still in the layer underneath, and the image still carries
+          them. That is why "install it and then remove it" is not the same
+          as "never install it", and it is the reason a single-stage image
+          built on a full toolchain is as big as the toolchain.
+
+          A second stage gives the build somewhere else to happen. The
+          toolchain is installed in `builder`, the artefact is produced
+          there, and only the artefact is copied into the final stage. The
+          final image never had the toolchain in it, so there is nothing to
+          delete and nothing to hide.
+
+          `COPY --from=<stage>` is a copy between stages, not between the
+          build context and the image. It works exactly like `COPY` from the
+          context, with one difference that catches people out: when the
+          source is a directory, Docker copies the directory's *contents*.
+          Copying `/build/artefact.txt` to `/app/artefact.txt` names the
+          file explicitly and leaves no ambiguity.
+        tags: [multi-stage, layers, optimisation]
+      - id: i-multi-stage-copy-from
+        title: Copy a directory out of a build stage
+        prompt: |
+          The builder stage produces a `tools` directory holding an
+          executable called `tcc` and a file called `notes.txt`. The final
+          image must contain them at `/app/tools/tcc` and
+          `/app/tools/notes.txt`, with `tcc` still executable.
+
+          The `COPY` instruction below does not do that. Fix it.
+
+          Leave the final stage's `CMD` as `ls /app`.
+        kind: image
+        entry_file: Dockerfile
+        files:
+          Dockerfile: |
+            FROM alpine:3.20 AS builder
+            RUN mkdir -p /build/tools \
+             && printf '#!/bin/sh\necho "tool v1"\n' > /build/tools/tcc \
+             && chmod +x /build/tools/tcc \
+             && echo "shared notes" > /build/tools/notes.txt
+
+            FROM alpine:3.20
+            COPY --from=builder /build/tools /app
+            CMD ["ls", "/app"]
+        solution:
+          Dockerfile: |
+            FROM alpine:3.20 AS builder
+            RUN mkdir -p /build/tools \
+             && printf '#!/bin/sh\necho "tool v1"\n' > /build/tools/tcc \
+             && chmod +x /build/tools/tcc \
+             && echo "shared notes" > /build/tools/notes.txt
+
+            FROM alpine:3.20
+            COPY --from=builder /build /app
+            CMD ["ls", "/app"]
+        checks:
+          - name: running the image lists the tools directory
+            kind: default
+          - name: the notes file is where it should be
+            kind: run
+            command: cat /app/tools/notes.txt
+          - name: the tool is still executable
+            kind: run
+            command: test -x /app/tools/tcc && echo "tool is executable"
+        cases:
+          - name: the default build
+        hints:
+          - "When the source of a `COPY` is a directory, Docker copies the directory's *contents*, not the directory itself."
+          - "`COPY --from=builder /build/tools /app` puts `tcc` at `/app/tcc`. To keep the `tools` directory, copy its parent."
+          - "`COPY --from=builder /build /app` puts the whole `tools` directory at `/app/tools`."
+        teach: |
+          `COPY <src> <dest>` has two behaviours that depend on what `<src>`
+          is, and they are worth stating separately:
+
+          * `<src>` is a **file**: it is copied to `<dest>`, which is renamed
+            to `<dest>` if `<dest>` is a path.
+          * `<src>` is a **directory**: its *contents* are copied into
+            `<dest>`. The directory itself is not part of the copy.
+
+          So `COPY --from=builder /build/tools /app` produces `/app/tcc` and
+          `/app/notes.txt`, while `COPY --from=builder /build /app` produces
+          `/app/tools/tcc` and `/app/tools/notes.txt`.
+
+          The general rule is the same as it is for the shell: think of the
+          copy as `cp -r /build/tools/. /app`. The trailing `/.` is what
+          distinguishes "the contents of" from "the directory".
+
+          `COPY` preserves the file mode, so an executable that was
+          `chmod +x` in the builder stage is still executable in the final
+          image. Anything that is not preserved -- and there is not much --
+          has to be fixed with a `RUN` afterwards.
+        tags: [multi-stage, files, dockerfile]
+      - id: i-multi-stage-stage-args
+        title: Scope a build argument to its stage
+        prompt: |
+          The build is passed a `VERSION` argument: the grader builds the
+          image twice, once with `VERSION=1.2.3` and once with
+          `VERSION=4.5.6`.
+
+          The builder stage must bake that value into a file, and the final
+          stage must ship the file at `/version.txt`. Running the image must
+          print the version it was built with.
+
+          The build argument is not reaching the builder stage. Fix it.
+        kind: image
+        entry_file: Dockerfile
+        files:
+          Dockerfile: |
+            FROM alpine:3.20 AS builder
+            RUN mkdir -p /build && echo "dev" > /build/version.txt
+
+            FROM alpine:3.20
+            ARG VERSION=dev
+            COPY --from=builder /build/version.txt /version.txt
+            CMD ["cat", "/version.txt"]
+        solution:
+          Dockerfile: |
+            FROM alpine:3.20 AS builder
+            ARG VERSION=dev
+            RUN mkdir -p /build && echo "$VERSION" > /build/version.txt
+
+            FROM alpine:3.20
+            COPY --from=builder /build/version.txt /version.txt
+            CMD ["cat", "/version.txt"]
+        checks:
+          - name: the image reports the version it was built with
+            kind: run
+            command: cat /version.txt
+        cases:
+          - name: version 1.2.3
+            build_args:
+              VERSION: "1.2.3"
+          - name: version 4.5.6
+            build_args:
+              VERSION: "4.5.6"
+        hints:
+          - "A build argument is only visible in the stage that declares it. Declare `VERSION` in the stage that uses it."
+          - "`ARG VERSION=dev` at the top of the builder stage, before the `RUN` that writes the file."
+          - "Inside a `RUN`, an `ARG` is read like an environment variable: `\"$VERSION\"`."
+        teach: |
+          `ARG` is scoped to a stage. An `ARG` declared in the builder stage
+          does not exist in the runtime stage, and an `ARG` declared in the
+          runtime stage does not exist in the builder stage. The rule is not
+          about ordering within a stage; it is about stages at all.
+
+          ```dockerfile
+          FROM alpine:3.20 AS builder
+          ARG VERSION=dev          # only this stage can see it
+          RUN echo "$VERSION" > /build/version.txt
+
+          FROM alpine:3.20
+          # VERSION is not in scope here.
+          ```
+
+          The exception is an `ARG` written *before* the first `FROM`. That
+          one is global: it can be used in any `FROM` line, which is how you
+          parameterise a base image, and a stage can pick it up by
+          re-declaring it.
+
+          ```dockerfile
+          ARG ALPINE_VERSION=3.20
+          FROM alpine:${ALPINE_VERSION} AS builder
+          ARG ALPINE_VERSION        # re-declared, so it is in scope here
+          ```
+
+          In both forms the value comes from `--build-arg`, and the default
+          after the `=` is only a fallback. That is why this exercise builds
+          the same Dockerfile twice: an argument that is read in the wrong
+          stage, or not read at all, produces the same image both times.
+        tags: [multi-stage, config, dockerfile]
+  - id: i-image-optimisation
+    title: Image optimisation
+    summary: >-
+      Base images, package caches, build contexts and layers -- the four
+      places where image size is won and lost.
+    body: |
+      # Image optimisation
+
+      An image is shipped to every machine that runs it, and it is pulled
+      again every time a node is replaced. Size is not a vanity metric: it
+      is pull time, registry storage, and cache pressure on the node that
+      has to hold it.
+
+      ## The base image decides the floor
+
+      Every image is the base image plus whatever you added. The base is
+      usually the largest single thing in it.
+
+      | Base | Uncompressed size | Has a shell | Has a package manager |
+      | --- | --- | --- | --- |
+      | `scratch` | ~0 MB | no | no |
+      | `alpine:3.20` | ~8 MB | yes | `apk` |
+      | `debian:bookworm-slim` | ~75 MB | yes | `apt` |
+      | `debian:bookworm` | ~117 MB | yes | `apt` |
+      | `gcr.io/distroless/static` | ~2 MB | no | no |
+
+      Alpine is small because it uses musl libc and busybox instead of glibc
+      and GNU coreutils. Distroless goes further: it has no shell and no
+      package manager at all, so there is nothing in it to attack and
+      nothing in it to debug with.
+
+      > **Callout**
+      > A distroless image cannot run `docker exec ... sh`. That is the
+      > point, but it means you need a debugger image, or a shell in a
+      > separate container, to look inside one.
+
+      ## `FROM scratch` is the floor under the floor
+
+      `scratch` is not a distribution. It is an empty filesystem: no
+      shell, no libraries, no `/etc`, nothing at all.
+
+      ```dockerfile
+      FROM alpine:3.20 AS source
+      FROM scratch
+      COPY --from=source /bin/busybox /bin/busybox
+      COPY --from=source /lib/ld-musl-x86_64.so.1 /lib/ld-musl-x86_64.so.1
+      ENTRYPOINT ["/bin/busybox"]
+      ```
+
+      The image is about 1.5 MB, against Alpine's 8. The second file is
+      the dynamic loader: `busybox` is linked against musl, and the loader
+      is what starts it. Copy the binary without the loader and the
+      container fails with "no such file or directory" -- a message about
+      the program that is really about the loader.
+
+      This is what the published distroless images do, except they do it
+      with a statically linked Go binary and nothing else at all.
+
+      ## The package cache is not free
+
+      `apk add` downloads an index and keeps it in `/var/cache/apk`.
+      `apt-get install` keeps its lists in `/var/lib/apt/lists`. Neither
+      belongs in the image.
+
+      ```dockerfile
+      RUN apk add --no-cache curl
+      ```
+
+      `--no-cache` tells apk not to keep the index at all. With apt the
+      equivalent is to remove the lists in the same instruction that
+      installed the packages:
+
+      ```dockerfile
+      RUN apt-get update \
+       && apt-get install -y --no-install-recommends curl \
+       && rm -rf /var/lib/apt/lists/*
+      ```
+
+      ## Deleting later does not make it smaller
+
+      This is the one that catches everybody:
+
+      ```dockerfile
+      RUN apk add curl        # layer 1: curl and its libraries
+      RUN rm -f /usr/bin/curl # layer 2: a whiteout, and nothing else
+      ```
+
+      The running container has no `curl`. The image still has curl's
+      bytes, because layer 2 is a diff that says "this path is empty", not
+      a diff that gives the space back. To make an image smaller, the
+      bytes must never have been added.
+
+      Install and remove in the *same* `RUN`, or do not install at all.
+
+      ## Layers, and what each one costs
+
+      Every `RUN`, `COPY` and `ADD` is a layer. Each one is a tarball the
+      daemon stores and ships, and each one is an entry in the build cache.
+      Two costs follow:
+
+      * **Size**: layers are stored as diffs, so a file added in one layer
+        and deleted in another is stored twice, in effect.
+      * **Build time**: a layer is cached until an instruction before it
+        changes. The cache key of a `RUN` includes the command *and* the
+        image it runs on, so putting the expensive, rarely-changing step
+        first means it is not repeated when the source changes.
+
+      ```dockerfile
+      FROM alpine:3.20
+      RUN apk add --no-cache curl     # rarely changes: stays cached
+      COPY . /app                     # changes on every commit
+      ```
+
+      Swap those two lines and every source change re-downloads curl.
+
+      ## The build context is sent to the daemon
+
+      `COPY . /app` copies the whole context, and the whole context is
+      uploaded to the daemon before the build starts. A `.dockerignore` file
+      at the root of the context says what to leave behind.
+
+      ```
+      .git
+      node_modules
+      *.log
+      notes.txt
+      ```
+
+      It is worth adding to every project that has one, even when the
+      Dockerfile copies files one at a time: the context is sent whether or
+      not you copy it.
+    exercises:
+      - id: i-optimise-base-image
+        title: Start from a small base image
+        prompt: |
+          This image is built on a full Debian base, so it weighs about
+          seventy-five megabytes before it does anything at all.
+
+          Rebuild it on `alpine:3.20` instead. The image must keep doing
+          the same job: running it prints the release of the distribution it
+          is built on.
+        kind: image
+        entry_file: Dockerfile
+        files:
+          Dockerfile: |
+            # A perfectly serviceable image -- just not a small one.
+            FROM debian:bookworm-slim
+
+            CMD ["cat", "/etc/alpine-release"]
+        solution:
+          Dockerfile: |
+            FROM alpine:3.20
+
+            CMD ["cat", "/etc/alpine-release"]
+        checks:
+          - name: the image is built on alpine
+            kind: run
+            command: cat /etc/alpine-release
+          - name: the image is small
+            kind: inspect
+            template: "{{.Size}}"
+            settings:
+              relative_tolerance: 0.05
+        cases:
+          - name: the default build
+        hints:
+          - "The base image is the `FROM` line. `alpine:3.20` is roughly eight megabytes; the Debian slim image is roughly seventy-five."
+          - "Keep the `CMD` the same -- the check runs the image and reads the release it prints."
+          - "The size check compares the built image against the reference with a five per cent margin, so a base image a few megabytes heavier will not pass."
+        teach: |
+          The base image is the floor. Everything you do on top of it adds
+          to a number you cannot go below, and you cannot remove what the
+          base already contains: a full Debian base carries a package
+          manager, a shell, documentation and a pile of shared libraries
+          whether you use them or not.
+
+          Alpine gets small by replacing glibc with musl and the GNU
+          coreutils with busybox. That is a real trade -- musl is not
+          binary-compatible with glibc, so a binary linked against glibc
+          will not run on it -- and it is the right trade for a small
+          utility, and the wrong one for a program that needs a native
+          extension built against glibc.
+
+          Distroless goes further and removes the shell and the package
+          manager entirely. That is the strongest security posture an image
+          can have, because there is nothing in it to run: no shell means
+          no shell injection, and no package manager means no way to
+          install one at runtime. The cost is that you cannot look inside
+          the container with `docker exec ... sh`, so you need a separate
+          image for that.
+
+          The size check compares against the reference with a margin,
+          because two correct Dockerfiles rarely produce byte-identical
+          images. What it will not accept is a base image that is several
+          times heavier.
+        tags: [optimisation, images, layers]
+      - id: i-optimise-no-cache
+        title: Leave the package index behind
+        prompt: |
+          This image installs `curl` with `apk`, and the package index that
+          `apk` downloads stays in the image at `/var/cache/apk`.
+
+          Install the tool so that the image carries no package index, while
+          still shipping `curl` itself. The image's own command must print
+          the path of `curl`.
+        kind: image
+        entry_file: Dockerfile
+        files:
+          Dockerfile: |
+            FROM alpine:3.20
+            RUN apk add curl
+            CMD ["sh", "-c", "command -v curl"]
+        solution:
+          Dockerfile: |
+            FROM alpine:3.20
+            RUN apk add --no-cache curl
+            CMD ["sh", "-c", "command -v curl"]
+        checks:
+          - name: the image prints where curl lives
+            kind: default
+          - name: the image carries no package index
+            kind: run
+            command: test -z "$(ls -A /var/cache/apk)" && echo "package index removed"
+        cases:
+          - name: the default build
+        hints:
+          - "`apk` has a flag that tells it not to keep the index it downloads. `apk add --no-cache curl`."
+          - "The other route is to remove `/var/cache/apk` in the same `RUN` that installed the package."
+          - "Whatever you do, `curl` itself must still be in the image -- the first check runs the image's own command."
+        teach: |
+          `apk add` needs a package index to resolve dependencies, and by
+          default it keeps that index in `/var/cache/apk`. On Alpine 3.20
+          that is a couple of megabytes of gzipped indexes sitting in an
+          image that will never install anything again.
+
+          `--no-cache` is the direct answer: apk downloads the index into a
+          temporary directory, uses it, and throws it away. The
+          `rm -rf /var/cache/apk/*` in the same `RUN` is the equivalent
+          written out, and it is what you have to do with `apt`, which has
+          no such flag:
+
+          ```dockerfile
+          RUN apt-get update \
+           && apt-get install -y --no-install-recommends curl \
+           && rm -rf /var/lib/apt/lists/*
+          ```
+
+          Note the shape of that instruction. The removal happens in the
+          *same* `RUN` as the install. If it were a separate `RUN`, the
+          index would still be in the layer below, and the image would
+          still be carrying it -- the check here would pass, but the image
+          would not be smaller.
+
+          `--no-install-recommends` is the other half of the habit. A
+          package's *recommends* are usually documentation and extra
+          tooling that a runtime container has no use for.
+        tags: [optimisation, layers, commands]
+      - id: i-optimise-scratch-base
+        title: An image with no shell at all
+        prompt: |
+          The smallest useful image contains the program and nothing else:
+          no shell, no package manager, no utilities, nothing to attack.
+
+          Build an image that holds only the `busybox` binary from
+          `alpine:3.20` and what that binary needs in order to start. It
+          must print `hello from scratch` when it runs, and it must be a
+          fraction of the size of an Alpine image.
+
+          The size is checked against a reference image with a generous
+          margin: an image that carries a shell or a package manager is
+          several times too big.
+        kind: image
+        entry_file: Dockerfile
+        files:
+          Dockerfile: |
+            # A perfectly good image -- with a shell, a package manager and
+            # every utility Alpine ships, in it.
+            FROM alpine:3.20
+
+            CMD ["echo", "hello from alpine"]
+        solution:
+          Dockerfile: |
+            FROM alpine:3.20 AS source
+
+            FROM scratch
+            COPY --from=source /bin/busybox /bin/busybox
+            COPY --from=source /lib/ld-musl-x86_64.so.1 /lib/ld-musl-x86_64.so.1
+            ENTRYPOINT ["/bin/busybox"]
+            CMD ["echo", "hello from scratch"]
+        checks:
+          - name: running the image prints the greeting
+            kind: default
+          - name: the image is small
+            kind: inspect
+            template: "{{.Size}}"
+            settings:
+              relative_tolerance: 0.2
+        cases:
+          - name: the default build
+        hints:
+          - "`FROM scratch` is an empty base image: there is nothing in it, not even a filesystem."
+          - "busybox is dynamically linked against musl, so it needs the loader `/lib/ld-musl-x86_64.so.1` as well as the binary itself."
+          - "Take both out of the Alpine image with `COPY --from=source ...`, and point the image's `ENTRYPOINT` at `/bin/busybox`."
+        teach: |
+          `FROM scratch` is not an operating system. It is an empty
+          filesystem -- no shell, no libraries, no `/etc`, nothing. It is
+          the base for the images that are called *distroless*: the
+          application binary and whatever it needs to start, and nothing
+          else.
+
+          The reason to go that far is attack surface. A shell in a
+          container is a shell somebody can use, and a package manager is a
+          way to get one if you find a way in. An image with neither has
+          nothing to escalate to.
+
+          The catch is that `busybox` is not a static binary. It is linked
+          against musl, the C library Alpine uses, and the dynamic loader
+          that starts it lives at `/lib/ld-musl-x86_64.so.1`. Copy the
+          binary without the loader and the container fails to start with
+          "no such file or directory", which is a famously unhelpful
+          message -- it is the loader that is missing, not the program.
+
+          ```dockerfile
+          FROM alpine:3.20 AS source
+          FROM scratch
+          COPY --from=source /bin/busybox /bin/busybox
+          COPY --from=source /lib/ld-musl-x86_64.so.1 /lib/ld-musl-x86_64.so.1
+          ENTRYPOINT ["/bin/busybox"]
+          CMD ["echo", "hello from scratch"]
+          ```
+
+          The second stage is what makes this a multi-stage build: the
+          Alpine image is the tool that provides the files, and it never
+          becomes the image that ships.
+
+          What you give up is the ability to look inside. `docker exec
+          scratch-image sh` does not work, because there is no shell to
+          exec. Debugging a distroless image means building a second
+          image with the tools in it, or attaching a debugger from
+          outside -- which is the trade every distroless user makes
+          deliberately.
+        tags: [optimisation, images, layers]
+      - id: i-optimise-no-bytes
+        title: Do not ship bytes you are going to delete
+        prompt: |
+          This image installs `curl` and then removes it again in a second
+          layer. The running container has no `curl`, but the image is
+          still five megabytes heavier than it needs to be: the second layer
+          only hides the first one, it does not give the bytes back.
+
+          Rebuild the image so that `curl` never reaches it at all. The
+          image's own command must still print `ready`, and the final image
+          must be essentially the size of the base image it is built on.
+        kind: image
+        entry_file: Dockerfile
+        files:
+          Dockerfile: |
+            FROM alpine:3.20
+            RUN apk add --no-cache curl
+            RUN rm -f /usr/bin/curl
+            CMD ["sh", "-c", "echo ready"]
+        solution:
+          Dockerfile: |
+            FROM alpine:3.20
+            CMD ["sh", "-c", "echo ready"]
+        checks:
+          - name: the image prints ready
+            kind: default
+          - name: the image does not contain curl
+            kind: run
+            command: test ! -e /usr/bin/curl && echo "no curl"
+          - name: the image does not carry the weight of curl
+            kind: inspect
+            template: "{{.Size}}"
+            settings:
+              relative_tolerance: 0.05
+        cases:
+          - name: the default build
+        hints:
+          - "A layer is a diff. `rm` in a later layer adds a marker saying 'this path is empty'; it does not remove the bytes from the layer below."
+          - "The only way to make an image smaller is to not put the bytes in it in the first place."
+          - "If a tool really is needed at build time only, that is what a second build stage is for."
+        teach: |
+          Layers are stored as differences against the layer below them, and
+          they are immutable. You cannot remove a file from a layer you
+          have already written; the best you can do is write a layer on top
+          that hides it.
+
+          That is why the two-line version of this Dockerfile is bigger than
+          the one-line version, even though the two images contain exactly
+          the same files. The first image stores curl's binary and its
+          libraries in one layer and a whiteout for the binary in another.
+          The second stores neither.
+
+          The general rule: **anything you install in the image is paid for
+          in the image**, whether or not it is there when the container
+          runs. If a tool is needed only while building, put it in a build
+          stage. If it is needed at run time, install it and remove it in
+          the same `RUN` -- or remove the *package* rather than the binary,
+          because `rm /usr/bin/curl` leaves curl's shared libraries behind.
+
+          ```dockerfile
+          RUN apk add --no-cache curl && apk del curl   # one layer, no residue
+          ```
+
+          The size check here has a five per cent margin, because an extra
+          empty layer still costs a few kilobytes. What it will not accept
+          is an image carrying several megabytes of a package it does not
+          use.
+        tags: [optimisation, layers, images]
+  - id: i-compose-basics
+    title: Compose basics
+    summary: >-
+      The compose file, the services in it, and the four commands you use
+      on a project all day.
+    body: |
+      # Compose basics
+
+      A compose file describes a project: a set of services, the images they
+      run, the ports they publish, and the volumes they share. One file,
+      one command, and the whole project comes up the same way on every
+      machine.
+
+      ## The file
+
+      ```yaml
+      services:
+        web:
+          image: alpine:3.20
+          command: ["echo", "hello from web"]
+          ports:
+            - "8080:80"
+      ```
+
+      The top-level key is `services`. Everything under it is one
+      container. A service has an `image` to run, or a `build` section
+      telling Compose how to make one:
+
+      ```yaml
+      services:
+        api:
+          build:
+            context: .
+            dockerfile: Dockerfile
+      ```
+
+      The file may be called `compose.yaml`, `compose.yml`,
+      `docker-compose.yaml` or `docker-compose.yml`. The first is the
+      current convention.
+
+      ## `docker compose config` is the debugger
+
+      ```bash
+      docker compose config
+      ```
+
+      This validates the file and prints it back in a canonical form:
+      every key filled in, every path resolved, every short form expanded.
+      It is the first thing to run when Compose does not do what you meant,
+      and it is the fastest way to find out what a file *actually* says
+      after interpolation.
+
+      ## The four commands
+
+      ```bash
+      docker compose up -d          # create and start everything
+      docker compose ps              # what is running
+      docker compose logs -f web     # follow one service's output
+      docker compose down            # stop and remove everything
+      ```
+
+      `up` is the one that does the work. Without `-d` it attaches to the
+      logs and streams them; with `-d` it detaches and returns, which is
+      what you want in a script or on a server.
+
+      `up` is also incremental. Run it again after changing the compose file
+      and it recreates only the services whose configuration changed.
+      `up --build` forces the images to be rebuilt as well.
+
+      `down` removes the containers and the network. It does **not** remove
+      named volumes unless you ask it to: `docker compose down --volumes`.
+      That asymmetry is deliberate -- volumes are the data, and `down` is
+      usually about the containers.
+
+      ## Images and builds
+
+      A service with `image:` is pulled. A service with `build:` is built
+      from the context you name. A service can have both, in which case
+      Compose builds it and tags the result with the name you gave:
+
+      ```yaml
+      services:
+        api:
+          image: my-api:1.0.0
+          build:
+            context: .
+      ```
+
+      That is the arrangement you want when the build is reproducible and
+      the tag is meaningful: `docker compose up --build` rebuilds, and the
+      image is tagged with a version rather than `latest`.
+    exercises:
+      - id: i-compose-service-image
+        title: A service that runs an image
+        prompt: |
+          Write a `compose.yaml` with one service called `web`.
+
+          The service must use the image `alpine:3.20` -- not build one --
+          and it must run the command `["echo", "hello from web"]` when it
+          starts.
+        kind: compose
+        entry_file: compose.yaml
+        files:
+          compose.yaml: |
+            services:
+              web:
+                image: alpine:3.20
+                # The service needs a command.
+        solution:
+          compose.yaml: |
+            services:
+              web:
+                image: alpine:3.20
+                command: ["echo", "hello from web"]
+        checks:
+          - name: the project is configured as required
+            kind: config
+          - name: the service really runs alpine
+            kind: service
+            service: web
+            command: cat /etc/alpine-release
+        cases:
+          - name: the default project
+        hints:
+          - "A service is a key under `services`. Its `image:` says what to run."
+          - "The `command:` key takes a list, the same way `CMD` in a Dockerfile does: `command: [\"echo\", \"hello from web\"]`."
+          - "`docker compose config` prints the file back in canonical form, which is a quick way to check what you wrote."
+        teach: |
+          A compose file is a description, and Compose turns it into
+          containers, networks and volumes. The `services` key is the only
+          one a small project needs.
+
+          `image:` and `build:` are different statements. `image:` names
+          something to pull; `build:` names a context to build from. A
+          service with `image: alpine:3.20` runs whatever that tag points
+          at today, which is a moving target if the tag is a moving tag.
+
+          `command:` is the same idea as `CMD` in a Dockerfile, and the same
+          two forms are available. The list form is the one to prefer:
+
+          ```yaml
+          command: ["echo", "hello from web"]   # exec form, no shell
+          command: echo hello from web           # shell form, /bin/sh -c
+          ```
+
+          The difference matters for signals and for anything with a space
+          or a quote in it, and it matters for how Compose reports the
+          service's configuration back to you.
+        tags: [compose, config, commands]
+      - id: i-compose-build-service
+        title: Build the service instead of pulling it
+        prompt: |
+          The project has a `Dockerfile` in it. The `api` service must run
+          the image built from that Dockerfile rather than a published one.
+
+          Change the compose file so that `api` is built from the project
+          directory. Do not give it a published image name.
+        kind: compose
+        entry_file: compose.yaml
+        files:
+          compose.yaml: |
+            services:
+              api:
+                image: alpine:3.20
+          Dockerfile: |
+            FROM alpine:3.20
+            RUN echo "built from source" > /built.txt
+            CMD ["cat", "/built.txt"]
+        solution:
+          compose.yaml: |
+            services:
+              api:
+                build:
+                  context: .
+                  dockerfile: Dockerfile
+          Dockerfile: |
+            FROM alpine:3.20
+            RUN echo "built from source" > /built.txt
+            CMD ["cat", "/built.txt"]
+        checks:
+          - name: the project is configured as required
+            kind: config
+            settings:
+              ignore_paths:
+                - services.api.build.dockerfile
+          - name: the service runs the image that was built
+            kind: service
+            service: api
+            command: cat /built.txt
+        cases:
+          - name: the default project
+        hints:
+          - "Replace the `image:` key with a `build:` key whose `context` is the project directory."
+          - "`build: .` is the short form of `build: {context: .}`. The `dockerfile:` key is only needed when it is not called `Dockerfile`."
+          - "The check reads the built image, so the file the Dockerfile writes has to be there."
+        teach: |
+          `build:` tells Compose to build an image from a context
+          directory. The `context` is sent to the daemon, and the
+          `dockerfile` key says which file in it is the Dockerfile -- when
+          it is called `Dockerfile` and lives at the root, that key is
+          optional.
+
+          ```yaml
+          build: .                          # short form
+          build:                            # long form
+            context: .
+            dockerfile: Dockerfile
+            target: runtime                # a stage to build
+            args:
+              - VERSION=1.2.3
+          ```
+
+          `target` is how Compose builds one stage of a multi-stage
+          Dockerfile, and `args` are the build arguments. Both are the
+          compose spelling of things you would pass to `docker build`.
+
+          When a service has both `build:` and `image:`, Compose builds it
+          and tags the result with the image name, which is how you get a
+          meaningful tag like `my-api:1.0.0` onto something you build
+          locally. Without an `image:` key, Compose names the result after
+          the project and the service.
+        tags: [compose, images, config]
+      - id: i-compose-publish-port
+        title: Publish a port to the host
+        prompt: |
+          A service that listens on port 80 inside its container is not
+          reachable from the host until Compose publishes that port.
+
+          Publish the `web` service's container port 80 on host port 8080.
+          The left-hand number is the host port, the right-hand number is
+          the container port.
+        kind: compose
+        entry_file: compose.yaml
+        files:
+          compose.yaml: |
+            services:
+              web:
+                image: alpine:3.20
+                # The service needs to be reachable from the host.
+        solution:
+          compose.yaml: |
+            services:
+              web:
+                image: alpine:3.20
+                ports:
+                  - "8080:80"
+        checks:
+          - name: the project is configured as required
+            kind: config
+          - name: the service really runs alpine
+            kind: service
+            service: web
+            command: cat /etc/alpine-release
+        cases:
+          - name: the default project
+        hints:
+          - "The `ports:` key takes a list. Each entry is `host:container`."
+          - "`- \"8080:80\"` publishes container port 80 on host port 8080."
+          - "Docker's own `-p` flag uses the same order, but the long form `--publish 8080:80` is easier to read."
+        teach: |
+          A container has its own network namespace. A port the process
+          inside it is listening on is not a port on the host, and
+          publishing one is what bridges the two.
+
+          ```yaml
+          ports:
+            - "8080:80"          # host 8080 -> container 80
+            - "127.0.0.1:8080:80"  # only from the loopback
+            - "8080:80/udp"      # a protocol
+          ```
+
+          The left-hand number is the host, the right-hand number is the
+          container. Getting them the wrong way round is the classic
+          mistake, and it fails quietly: the container is fine, the
+          published port is just not the one you wanted.
+
+          A published port is bound on all interfaces unless you say
+          otherwise, which means it is reachable from the network the
+          machine is on. For anything that should only be reachable
+          locally, bind it to `127.0.0.1`.
+
+          Publishing a port and connecting to a service by name are
+          different mechanisms. Inside a Compose project, services talk to
+          each other over the project's network by name and never need a
+          published port at all -- publishing is for traffic that comes
+          from outside.
+        tags: [compose, config, operations]
+      - id: i-compose-lifecycle
+        title: Up, list, log, down
+        prompt: |
+          A Compose project is already running in the working directory.
+          It has one service, `web`, using the `alpine:3.20` image, whose
+          command prints `hello-from-web` and then keeps running.
+
+          Write a script that does three things, in this order:
+
+          1. print the service name and the state of every container in the
+             project, one container per line;
+          2. print the project's log output, without the `web-1  |` prefix
+             Compose puts in front of each line;
+          3. stop the project with `docker compose down`, then print the
+             same listing again -- which is now empty.
+
+          The script's output must be exactly:
+
+          ```
+          web running
+          hello-from-web
+          ```
+        kind: cli
+        entry_file: solve.sh
+        files:
+          solve.sh: |
+            #!/bin/sh
+            # Your commands here.
+            echo "not implemented yet"
+        setup:
+          - "printf 'services:\n  web:\n    image: alpine:3.20\n    command: [\"sh\", \"-c\", \"echo hello-from-web; sleep 300\"]\n' > compose.yaml"
+          - "docker compose up -d"
+        teardown:
+          - "docker compose down --volumes --remove-orphans"
+          - "rm -f compose.yaml"
+        solution:
+          solve.sh: |
+            docker compose ps --format '{{.Service}} {{.State}}'
+            docker compose logs --no-log-prefix
+            docker compose down --volumes --remove-orphans >/dev/null 2>&1
+            docker compose ps -a --format '{{.Service}} {{.State}}'
+        checks:
+          - name: the script's output
+            kind: script
+            command: sh solve.sh
+            settings:
+              scrub: true
+        cases:
+          - name: the default project
+        hints:
+          - "`docker compose ps --format '{{.Service}} {{.State}}'` prints the service name and its state, one per line."
+          - "`docker compose logs --no-log-prefix` drops the `web-1  |` prefix Compose adds to each log line."
+          - "After `docker compose down` the containers are gone, so `docker compose ps -a` prints nothing at all."
+        teach: |
+          Four commands cover most of what you do with a Compose project.
+
+          ```bash
+          docker compose up -d          # create and start, then detach
+          docker compose ps              # what is running
+          docker compose logs -f web     # follow one service
+          docker compose down            # stop and remove
+          ```
+
+          `up` is incremental: it compares the configuration of each
+          service with the container it already has and recreates only what
+          changed. `up --build` also rebuilds the images. `down` removes the
+          containers and the project network, but leaves named volumes
+          alone unless you add `--volumes`.
+
+          The `--format` option is what makes any of this scriptable. The
+          default `ps` output is a table built for a human, with column
+          widths that depend on the terminal; `ps --format '{{.Service}}
+          {{.State}}'` is one line per container with fixed fields. The
+          same is true of `logs`, which prefixes every line with the
+          service and container name unless you pass `--no-log-prefix`.
+
+          `docker compose ps -a` includes the containers that have stopped.
+          It is the one to reach for when a service exited and you want to
+          know what its exit code was.
+        tags: [compose, cli, operations]
+  - id: i-compose-networks-and-config
+    title: Networks and configuration
+    summary: >-
+      Service-to-service DNS, start-up order, environment variables and
+      healthchecks -- the parts of a compose file that decide how the
+      services behave rather than what they are.
+    body: |
+      # Networks and configuration
+
+      ## Every project gets a network
+
+      A Compose project creates a bridge network for itself, and every
+      service in the project is attached to it. Inside that network,
+      Docker runs an embedded DNS server, and every service is registered
+      under its name.
+
+      That is why `api` can connect to `db` without anybody configuring a
+      hostname:
+
+      ```yaml
+      services:
+        api:
+          image: my-api:1.0.0
+        db:
+          image: postgres:16-alpine
+          environment:
+            POSTGRES_PASSWORD: secret
+      ```
+
+      ```bash
+      docker compose exec api nslookup db
+      ```
+
+      The service name resolves to the container's address on the project
+      network. The container name resolves to the same thing. Nothing
+      outside the project can reach it, because the network is not attached
+      to the host.
+
+      ## Naming your own networks
+
+      A project sometimes needs more than one network, or a network with
+      specific properties:
+
+      ```yaml
+      services:
+        api:
+          networks:
+            - backend
+        db:
+          networks:
+            - backend
+      networks:
+        backend:
+          driver: bridge
+      ```
+
+      A service attached to two networks can talk to both, and the networks
+      are the unit of isolation. A common shape is a `frontend` network
+      that the web tier and the proxy share, and a `backend` network that
+      only the web tier and the database share -- so the database is
+      reachable from the web tier and from nothing else.
+
+      ## Start-up order
+
+      `depends_on` says which service should start first:
+
+      ```yaml
+      services:
+        db:
+          image: postgres:16-alpine
+        api:
+          depends_on:
+            - db
+      ```
+
+      The short form means "start `db` before `api`". It does **not** mean
+      "wait until `db` is ready" -- and "ready" for a database is a long
+      way from "started".
+
+      ```yaml
+      services:
+        api:
+          depends_on:
+            db:
+              condition: service_healthy
+      ```
+
+      The long form can wait for three things: `service_started`,
+      `service_healthy`, and `service_completed_successfully`. The
+      healthy condition needs the dependency to have a healthcheck, which
+      is the next section.
+
+      ## Healthchecks
+
+      A healthcheck is a command Compose runs inside a container to decide
+      whether it is working:
+
+      ```yaml
+      services:
+        web:
+          image: my-web:1.0.0
+          healthcheck:
+            test: ["CMD-SHELL", "wget -q -O- http://127.0.0.1/ || exit 1"]
+            interval: 10s
+            timeout: 5s
+            retries: 3
+      ```
+
+      `CMD` runs the command directly, with no shell, so it cannot use
+      `||` or pipes. `CMD-SHELL` runs it through `/bin/sh -c`, which it
+      usually needs. A healthcheck that fails `retries` times in a row
+      marks the container unhealthy, and an unhealthy container is what
+      `condition: service_healthy` is waiting for.
+
+      ## Environment variables
+
+      ```yaml
+      services:
+        api:
+          environment:
+            APP_ENV: production
+            LOG_LEVEL: debug
+      ```
+
+      The mapping form and the list form (`- APP_ENV=production`) mean the
+      same thing. A key with no value -- `APP_ENV:` -- means "take this
+      value from the environment Compose itself is running in", which is
+      how you pass a value through from the shell without writing it into
+      the file.
+
+      `env_file` does something different: it reads a file of `KEY=value`
+      lines and puts them in the container. The file stays out of the
+      compose file, which is where a secret belongs.
+    exercises:
+      - id: i-compose-custom-network
+        title: Put the services on a named network
+        prompt: |
+          Two services, `api` and `db`, are defined but they are not
+          attached to any network the project names.
+
+          Give the project a bridge network called `backend` and attach
+          both services to it, so that they can reach each other by name.
+        kind: compose
+        entry_file: compose.yaml
+        files:
+          compose.yaml: |
+            services:
+              api:
+                image: alpine:3.20
+              db:
+                image: alpine:3.20
+        solution:
+          compose.yaml: |
+            services:
+              api:
+                image: alpine:3.20
+                networks:
+                  - backend
+              db:
+                image: alpine:3.20
+                networks:
+                  - backend
+            networks:
+              backend:
+                driver: bridge
+        checks:
+          - name: the project is configured as required
+            kind: config
+          - name: the service is on a network with a resolver
+            kind: service
+            service: api
+            command: grep nameserver /etc/resolv.conf
+        cases:
+          - name: the default project
+        hints:
+          - "A service lists the networks it is attached to under its own `networks:` key."
+          - "The network itself is defined at the top level, next to `services:` -- `networks:` and then the name and its driver."
+          - "A network that no service is attached to does not appear in the project's configuration at all."
+        teach: |
+          A Compose project always has a network, even when you never
+          mention one: Compose creates a bridge network named after the
+          project and puts every service on it. Docker's embedded DNS
+          server runs on that network and registers each service under its
+          name, which is where the service-to-service name resolution comes
+          from.
+
+          Naming networks yourself is what you do when one network is not
+          enough. The network is the unit of isolation: a container can
+          only be reached by things on the networks it is attached to.
+          Two tiers -- a `frontend` network for the proxy and the web tier,
+          a `backend` network for the web tier and the database -- mean
+          the database is reachable from the web tier and from nowhere
+          else, even though everything is in one project.
+
+          A service lists its networks under its own `networks:` key, and
+          the network is defined at the top level of the file. A network
+          that no service uses is not created, which is why the
+          configuration check fails if you define `backend` but forget to
+          attach anything to it.
+
+          The resolver check is a small but real fact about the runtime: a
+          container on a user-defined network is given `127.0.0.11` as its
+          nameserver, which is Docker's embedded DNS. On the default
+          bridge there is no such server, and containers can only reach
+          each other by IP address.
+        tags: [compose, networks, config]
+      - id: i-compose-depends-on
+        title: Wait for a dependency to be healthy
+        prompt: |
+          `db` must not start until `web` is healthy, not merely until it
+          has started. A container that has started and a container that is
+          ready to serve traffic are two different things.
+
+          Make `db` depend on `web` with the `service_healthy` condition.
+          The short list form of `depends_on` will not do.
+        kind: compose
+        entry_file: compose.yaml
+        files:
+          compose.yaml: |
+            services:
+              web:
+                image: alpine:3.20
+                healthcheck:
+                  test: ["CMD", "true"]
+                  interval: 10s
+                  timeout: 3s
+                  retries: 3
+              db:
+                image: alpine:3.20
+        solution:
+          compose.yaml: |
+            services:
+              web:
+                image: alpine:3.20
+                healthcheck:
+                  test: ["CMD", "true"]
+                  interval: 10s
+                  timeout: 3s
+                  retries: 3
+              db:
+                image: alpine:3.20
+                depends_on:
+                  web:
+                    condition: service_healthy
+        checks:
+          - name: the project is configured as required
+            kind: config
+          - name: the service really runs alpine
+            kind: service
+            service: db
+            command: cat /etc/alpine-release
+        cases:
+          - name: the default project
+        hints:
+          - "The short form of `depends_on` is a list of service names. The long form is a mapping, and it is the only one that can carry a condition."
+          - "`depends_on: {web: {condition: service_healthy}}` is the shape you want."
+          - "The condition only means something if the dependency has a healthcheck."
+        teach: |
+          `depends_on` in its short form is a start-up ordering, nothing
+          more:
+
+          ```yaml
+          depends_on:
+            - db
+          ```
+
+          Compose starts `db` before `api`, and `api` starts as soon as
+          `db`'s container has been created and started. For a database
+          that is nowhere near enough -- the process is running long before
+          it accepts connections.
+
+          The long form adds a condition:
+
+          ```yaml
+          depends_on:
+            db:
+              condition: service_healthy
+          ```
+
+          `service_healthy` waits for the dependency's healthcheck to pass,
+          `service_completed_successfully` waits for a one-shot job to exit
+          with status zero, and `service_started` is the short form
+          spelled out.
+
+          The condition is evaluated against the healthcheck, which is why
+          the two features belong together. A dependency with no
+          healthcheck can never become healthy, and a `service_healthy`
+          dependency with no healthcheck is a project that never starts.
+
+          Compose reports the wait rather than hanging silently -- which is
+          worth knowing when a project takes a minute to come up, and worth
+          knowing because the wait is invisible in `docker compose up -d`.
+        tags: [compose, healthchecks, config]
+      - id: i-compose-environment
+        title: Give a service its environment
+        prompt: |
+          The `api` service must run with two environment variables:
+          `APP_ENV` set to `production` and `LOG_LEVEL` set to `debug`.
+
+          Set them in the compose file. The grader starts the service and
+          reads the variables back out of it.
+        kind: compose
+        entry_file: compose.yaml
+        files:
+          compose.yaml: |
+            services:
+              api:
+                image: alpine:3.20
+        solution:
+          compose.yaml: |
+            services:
+              api:
+                image: alpine:3.20
+                environment:
+                  APP_ENV: production
+                  LOG_LEVEL: debug
+        checks:
+          - name: the project is configured as required
+            kind: config
+          - name: the variables reach the container
+            kind: service
+            service: api
+            command: echo "$APP_ENV $LOG_LEVEL"
+        cases:
+          - name: the default project
+        hints:
+          - "The `environment:` key takes a mapping of names to values, or a list of `NAME=value` strings."
+          - "`environment: {APP_ENV: production, LOG_LEVEL: debug}` and `environment: [APP_ENV=production, LOG_LEVEL=debug]` are the same thing to Compose."
+          - "A key with no value after the colon means 'take it from the environment Compose is running in'."
+        teach: |
+          `environment` sets variables inside the container. There are two
+          spellings and Compose normalises both into the same mapping:
+
+          ```yaml
+          environment:
+            APP_ENV: production        # mapping form
+            LOG_LEVEL: debug
+          ```
+
+          ```yaml
+          environment:
+            - APP_ENV=production        # list form
+            - LOG_LEVEL=debug
+          ```
+
+          A key with an empty value has a third meaning. `APP_ENV:` says
+          "pass `APP_ENV` through from the environment Compose is running
+          in", and it is null in the canonical configuration until Compose
+          resolves it. That is how a value can come from the shell, or
+          from a `.env` file next to the compose file, without being
+          written into the compose file itself.
+
+          `env_file` is the other half of the story. It names a file of
+          `KEY=value` lines that Compose reads and puts in the container:
+
+          ```yaml
+          env_file:
+            - .env
+          ```
+
+          The difference matters for secrets. A value in `environment:` is
+          in the compose file, and the compose file is usually in the
+          repository. A value in an `env_file` is in a file you can leave
+          out of the repository.
+
+          Neither of these is a secret store. Both put the value in the
+          container's configuration, where anyone with permission to run
+          `docker inspect` can read it.
+        tags: [compose, config, commands]
+      - id: i-compose-healthcheck
+        title: Declare a healthcheck
+        prompt: |
+          A service that has a healthcheck is a service Compose can wait
+          for, route around, and report on. This one has none.
+
+          Give `web` a healthcheck that succeeds once the service is ready.
+          The check must be the list `["CMD-SHELL", "test -f /tmp/ready || exit 1"]`,
+          with `interval` 10s, `timeout` 5s and `retries` 3.
+        kind: compose
+        entry_file: compose.yaml
+        files:
+          compose.yaml: |
+            services:
+              web:
+                image: alpine:3.20
+                command: ["sh", "-c", "sleep 5 && touch /tmp/ready && sleep 300"]
+        solution:
+          compose.yaml: |
+            services:
+              web:
+                image: alpine:3.20
+                command: ["sh", "-c", "sleep 5 && touch /tmp/ready && sleep 300"]
+                healthcheck:
+                  test: ["CMD-SHELL", "test -f /tmp/ready || exit 1"]
+                  interval: 10s
+                  timeout: 5s
+                  retries: 3
+        checks:
+          - name: the project is configured as required
+            kind: config
+          - name: the service really runs alpine
+            kind: service
+            service: web
+            command: cat /etc/alpine-release
+        cases:
+          - name: the default project
+        hints:
+          - "The `healthcheck:` key takes a `test`, an `interval`, a `timeout` and a `retries`."
+          - "`CMD` runs the command directly, with no shell. `CMD-SHELL` runs it through `/bin/sh -c`, which is what `||` needs."
+          - "The durations are strings with a unit: `10s`, `5s`, `1m30s`."
+        teach: |
+          A healthcheck answers one question, repeatedly: is this container
+          doing its job? Docker runs the command inside the container and
+          looks at the exit code.
+
+          ```yaml
+          healthcheck:
+            test: ["CMD-SHELL", "wget -q -O- http://127.0.0.1/ || exit 1"]
+            interval: 10s
+            timeout: 5s
+            retries: 3
+            start_period: 20s
+          ```
+
+          `CMD` runs the command directly, with no shell, so it cannot use
+          `||`, pipes or redirections. `CMD-SHELL` runs it through
+          `/bin/sh -c`, which is nearly always what you want, at the cost
+          of a shell in the container.
+
+          The timings have distinct meanings. `interval` is how often the
+          check runs, `timeout` is how long it may take before it counts as
+          a failure, and `retries` is how many failures in a row it takes
+          to mark the container unhealthy. `start_period` is the grace
+          period during which failures do not count -- essential for
+          anything that takes a minute to warm up, because without it a
+          slow start looks exactly like a broken service.
+
+          The result is what `depends_on: {db: {condition:
+          service_healthy}}` waits for, and what `docker compose ps` shows
+          in its `STATUS` column.
+        tags: [compose, healthchecks, config]
+  - id: i-running-containers
+    title: Running containers
+    summary: >-
+      The CLI you reach for when something is already running: listing,
+      reading logs, running a command inside, and inspecting the facts.
+    body: |
+      # Running containers
+
+      Everything so far has been about building things. This lesson is
+      about the other half of the job: a container is running, and you need
+      to know what it is doing.
+
+      ## Listing
+
+      ```bash
+      docker ps                 # what is running now
+      docker ps -a              # what has ever run
+      docker ps --filter status=exited
+      ```
+
+      The default output is a table, which is for humans. Scripts want
+      fields:
+
+      ```bash
+      docker ps --format '{{.Names}}'
+      docker ps --format '{{.Names}}\t{{.Status}}'
+      ```
+
+      `--format` takes a Go template, and the fields are the ones in
+      `docker ps --format json`. The ones worth knowing:
+
+      | Field | What it is |
+      | --- | --- |
+      | `.ID` | the container id, short |
+      | `.Names` | the name you gave it |
+      | `.Image` | the image it was created from |
+      | `.Status` | `Up 3 minutes` or `Exited (0) 2 minutes ago` |
+      | `.State` | `running`, `exited`, `paused` |
+      | `.Ports` | what is published |
+
+      Filters are how you narrow it down, and they combine with AND:
+
+      ```bash
+      docker ps --filter name=web --filter status=running
+      docker ps --filter label=role=api
+      docker ps --filter ancestor=my-api:1.0.0
+      ```
+
+      > **Callout**
+      > Labels are the only durable way to find your containers. A name is
+      > unique on the machine and a label is not, so a label is what you
+      > filter on in a script that has to work on more than one host.
+
+      ## Logs
+
+      ```bash
+      docker logs web                # stdout and stderr
+      docker logs -f web             # follow
+      docker logs --tail 100 web     # the last hundred lines
+      docker logs --since 5m web     # the last five minutes
+      ```
+
+      A container's logs are the output of its main process, and nothing
+      else. Anything written to a file inside the container is not in
+      `docker logs`; it is in the file, in the container's writable layer,
+      and it is gone when the container is removed.
+
+      ## Getting inside
+
+      ```bash
+      docker exec web sh             # a shell in a running container
+      docker exec -u root web sh     # as another user
+      docker exec -it web sh         # with a terminal attached
+      docker exec web ls /app        # one command, no shell
+      ```
+
+      `exec` needs a container that is already running. For a container
+      that has stopped, `docker start` it first, or use `docker cp` to get
+      files out of it.
+
+      ## Inspecting
+
+      ```bash
+      docker inspect web
+      docker inspect --format '{{.State.Status}}' web
+      docker inspect --format '{{.Config.Image}}' web
+      ```
+
+      `docker inspect` returns the whole configuration as JSON: the
+      container's state, its mounts, its network settings, the environment
+      it was started with, and the image it was created from. The
+      `--format` option applies a Go template to it, which is how you pull
+      one field out of it.
+
+      The same templates work on images:
+
+      ```bash
+      docker image inspect --format '{{len .RootFS.Layers}}' my-api:1.0.0
+      docker image inspect --format '{{.Size}}' my-api:1.0.0
+      ```
+    exercises:
+      - id: i-cli-list-containers
+        title: List the containers you care about
+        prompt: |
+          Two containers are running. One of them carries the label
+          `trainer=cli-list`; the other does not.
+
+          Print the name of every running container that carries that
+          label, one name per line.
+        kind: cli
+        entry_file: solve.sh
+        files:
+          solve.sh: |
+            #!/bin/sh
+            # Your commands here.
+            echo "not implemented yet"
+        setup:
+          - "docker rm -f trainer-listing trainer-other >/dev/null 2>&1 || true"
+          - "docker run -d --name trainer-listing --label trainer=cli-list alpine:3.20 sleep 300"
+          - "docker run -d --name trainer-other --label trainer=other alpine:3.20 sleep 300"
+        teardown:
+          - "docker rm -f trainer-listing trainer-other >/dev/null 2>&1 || true"
+        solution:
+          solve.sh: |
+            docker ps --filter label=trainer=cli-list --format '{{.Names}}' | sort
+        checks:
+          - name: the script's output
+            kind: script
+            command: sh solve.sh
+            settings:
+              scrub: true
+        cases:
+          - name: the default environment
+        hints:
+          - "`docker ps --filter label=trainer=cli-list` narrows the list to the containers with that label."
+          - "`--format '{{.Names}}'` prints one name per line instead of the table."
+          - "Add `| sort` if you want a stable order."
+        teach: |
+          `docker ps` lists the running containers; `docker ps -a` lists
+          every container the daemon knows about, running or not. The
+          default table is wide and its columns depend on the terminal, so
+          anything that is going to be read by a script should ask for the
+          fields it wants:
+
+          ```bash
+          docker ps --format '{{.Names}}'
+          docker ps --format '{{.Names}} {{.State}}'
+          ```
+
+          Filters are the other half. `--filter name=web` matches on the
+          name, `--filter status=running` on the state, `--filter
+          ancestor=my-api:1.0.0` on the image the container was created
+          from, and `--filter label=key=value` on a label. Several
+          filters are combined with AND, so `--filter status=running
+          --filter label=role=api` is "running containers labelled
+          `role=api`".
+
+          Labels beat names for this. A name is unique on one machine, so
+          it says nothing on the next one, and it says nothing about what
+          the container is *for*. A label is a key-value pair you attach
+          when you create the container, and filtering on it is how you
+          find your own containers on a host where somebody else is
+          running theirs.
+        tags: [cli, commands, operations]
+      - id: i-cli-read-logs
+        title: Read what a container printed
+        prompt: |
+          A container named `trainer-logs` is running. Its command printed
+          two lines and is now sleeping.
+
+          Print the output the container has produced so far.
+        kind: cli
+        entry_file: solve.sh
+        files:
+          solve.sh: |
+            #!/bin/sh
+            # Your commands here.
+            echo "not implemented yet"
+        setup:
+          - "docker rm -f trainer-logs >/dev/null 2>&1 || true"
+          - "docker run -d --name trainer-logs --label trainer=cli-logs alpine:3.20 sh -c 'echo first line; echo second line; sleep 300'"
+          - "sh -c 'i=0; while [ $i -lt 60 ]; do docker logs trainer-logs 2>/dev/null | grep -q second && break; i=$((i+1)); sleep 0.1; done'"
+        teardown:
+          - "docker rm -f trainer-logs >/dev/null 2>&1 || true"
+        solution:
+          solve.sh: |
+            docker logs trainer-logs
+        checks:
+          - name: the script's output
+            kind: script
+            command: sh solve.sh
+            settings:
+              scrub: true
+        cases:
+          - name: the default environment
+        hints:
+          - "`docker logs <container>` prints what the container's main process has written."
+          - "Add `-f` to follow the output as it arrives, and `--tail 100` to limit how much you get."
+          - "The container's name is `trainer-logs`."
+        teach: |
+          `docker logs` reads the log files the daemon keeps for a
+          container. It shows both stdout and stderr, interleaved in the
+          order they were written, and it works on a stopped container as
+          well as a running one.
+
+          ```bash
+          docker logs web                 # everything
+          docker logs -f web              # follow, like tail -f
+          docker logs --tail 100 web      # the last hundred lines
+          docker logs --since 10m web     # the last ten minutes
+          docker logs -t web              # with timestamps
+          ```
+
+          What it does *not* show is anything the container wrote to a
+          file. A log file inside the container is in the container's
+          writable layer, and it disappears with the container. If the
+          output has to survive, it has to go to stdout and stderr, or to a
+          volume.
+
+          The `-f` flag is the one to be careful with in a script: it
+          blocks until the container exits. `--tail` and `--since` are the
+          ones to reach for when you want a snapshot.
+        tags: [cli, commands, operations]
+      - id: i-cli-exec-in-container
+        title: Run a command inside a running container
+        prompt: |
+          A container named `trainer-demo` is running.
+
+          Run a command inside it and print the output: the release of the
+          Alpine distribution the container is running.
+        kind: cli
+        entry_file: solve.sh
+        files:
+          solve.sh: |
+            #!/bin/sh
+            # Your commands here.
+            echo "not implemented yet"
+        setup:
+          - "docker rm -f trainer-demo >/dev/null 2>&1 || true"
+          - "docker run -d --name trainer-demo --label trainer=cli-exec alpine:3.20 sleep 300"
+        teardown:
+          - "docker rm -f trainer-demo >/dev/null 2>&1 || true"
+        solution:
+          solve.sh: |
+            docker exec trainer-demo cat /etc/alpine-release
+        checks:
+          - name: the script's output
+            kind: script
+            command: sh solve.sh
+            settings:
+              scrub: true
+        cases:
+          - name: the default environment
+        hints:
+          - "`docker exec <container> <command> ...` runs a command in a container that is already running."
+          - "The release of the distribution is in `/etc/alpine-release`."
+          - "Without `-it` the command's output is just printed, which is what you want in a script."
+        teach: |
+          `docker exec` runs a new process inside a container that is
+          already running. It is how you look at a live system: check a
+          file, read a configuration, run a tool that is not in the image.
+
+          ```bash
+          docker exec web cat /etc/hostname      # one command
+          docker exec web sh -c 'ls -la /app'    # a shell, with a command
+          docker exec -it web sh                 # an interactive shell
+          docker exec -u root web id             # as another user
+          ```
+
+          The command runs as the container's user by default, which is
+          often not root, and `-u` changes that. `-it` allocates a
+          terminal and keeps stdin open, which is what makes an
+          interactive shell work and what you leave out in a script.
+
+          Two limits worth knowing. `exec` needs a *running* container: for
+          a stopped one, `docker start` it first, or use `docker cp` to
+          take a file out of it. And you cannot `exec` a *shell* into a
+          distroless image, because there is no shell inside it to exec.
+        tags: [cli, commands, operations]
+      - id: i-cli-inspect-container
+        title: Read a container's facts
+        prompt: |
+          A container named `trainer-demo` is running.
+
+          Use `docker inspect` to print two facts about it, one per line
+          and in this order:
+
+          1. the image it was created from;
+          2. the state it is in.
+        kind: cli
+        entry_file: solve.sh
+        files:
+          solve.sh: |
+            #!/bin/sh
+            # Your commands here.
+            echo "not implemented yet"
+        setup:
+          - "docker rm -f trainer-demo >/dev/null 2>&1 || true"
+          - "docker run -d --name trainer-demo --label trainer=cli-inspect alpine:3.20 sleep 300"
+        teardown:
+          - "docker rm -f trainer-demo >/dev/null 2>&1 || true"
+        solution:
+          solve.sh: |
+            docker inspect --format '{{.Config.Image}}' trainer-demo
+            docker inspect --format '{{.State.Status}}' trainer-demo
+        checks:
+          - name: the script's output
+            kind: script
+            command: sh solve.sh
+            settings:
+              scrub: true
+        cases:
+          - name: the default environment
+        hints:
+          - "`docker inspect --format '<template>' <container>` prints one field of the container's configuration."
+          - "The image is at `.Config.Image` and the state is at `.State.Status`."
+          - "Run `docker inspect trainer-demo` without `--format` to see the whole thing, and find the fields you need."
+        teach: |
+          `docker inspect` returns a container's full configuration as
+          JSON: its state, its mounts, its network settings, the
+          environment it was started with, the labels on it, and the image
+          it was created from. It is the same document the daemon stores,
+          so it is the ground truth about a container.
+
+          Reading the whole document is rarely what you want, because it is
+          large and most of it is not interesting. `--format` applies a Go
+          template to it instead:
+
+          ```bash
+          docker inspect --format '{{.State.Status}}' web
+          docker inspect --format '{{.Config.Image}}' web
+          docker inspect --format '{{.NetworkSettings.IPAddress}}' web
+          docker inspect --format '{{json .Config.Env}}' web
+          ```
+
+          The same templates work on images, which is how you read an
+          image's layers, size or exposed ports:
+
+          ```bash
+          docker image inspect --format '{{len .RootFS.Layers}}' my-api:1.0.0
+          docker image inspect --format '{{.Size}}' my-api:1.0.0
+          ```
+
+          Two things to keep in mind. The fields are the daemon's view, not
+          the container's: `.State.Status` says whether the container is
+          running, and `docker exec` says what is happening inside it.
+          And the templates are Go templates, so `{{json .Config.Env}}` is
+          the way to get a list out as JSON rather than as Go's own
+          formatting of it.
+        tags: [cli, commands, operations]
+  - id: i-volumes-and-mounts
+    title: Volumes and mounts
+    summary: >-
+      Named volumes, bind mounts, and the difference between what survives
+      a container and what does not.
+    body: |
+      # Volumes and mounts
+
+      ## The container's own filesystem is disposable
+
+      A container's writable layer is a diff against the image. When the
+      container is removed, the diff goes with it. Anything the container
+      wrote -- a log file, a database's data directory, a file a user
+      uploaded -- is gone.
+
+      ```bash
+      docker run --rm alpine:3.20 sh -c 'echo hello > /tmp/note.txt'
+      # the file is gone; the container never existed as far as the
+      # filesystem is concerned
+      ```
+
+      This is the right default. A container is a process, not a place to
+      keep things.
+
+      ## Named volumes
+
+      A named volume is storage the daemon manages, outside the container's
+      filesystem:
+
+      ```bash
+      docker volume create pgdata
+      docker run --name db -v pgdata:/var/lib/postgresql/data postgres:16
+      ```
+
+      The volume is created if it does not exist. It survives the
+      container, and it survives `docker rm`. `docker volume ls` lists
+      them; `docker volume rm` removes one and everything in it, once
+      nothing is using it.
+
+      ## Bind mounts
+
+      A bind mount maps a path on the host into the container:
+
+      ```bash
+      docker run --rm -v "$PWD/src:/app/src:ro" my-api:1.0.0
+      ```
+
+      The path is on the host, and it is the host's file that the
+      container sees. The `:ro` suffix mounts it read-only, which is
+      the right thing for anything the container only reads, and the
+      wrong thing for a data directory.
+
+      ## Which one to use
+
+      | | Named volume | Bind mount |
+      | --- | --- | --- |
+      | Lives | with the daemon | wherever you put it |
+      | Owned by | Docker | you |
+      | Survives `docker rm` | yes | yes |
+      | Good for | application data | source code, config, logs |
+
+      The rule of thumb: a named volume for data the application owns, a
+      bind mount for things you want to edit from the host.
+
+      ## In a compose file
+
+      ```yaml
+      services:
+        db:
+          image: postgres:16
+          volumes:
+            - pgdata:/var/lib/postgresql/data
+            - ./init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+      volumes:
+        pgdata:
+      ```
+
+      A short form that is just a name -- `pgdata` -- is a named volume.
+      Anything with a slash in it is a bind mount. The top-level
+      `volumes:` key declares the named ones; Compose creates them if they
+      do not exist and prefixes their names with the project name, so two
+      projects do not share one by accident.
+
+      `docker compose down` does **not** remove named volumes. That is
+      deliberate: the volume is the data, and `down` is about the
+      containers. `docker compose down --volumes` removes them, and
+      everything in them.
+    exercises:
+      - id: i-volumes-named
+        title: Write to a named volume, read it back
+        prompt: |
+          A named volume called `trainer-data` exists.
+
+          Write the line `still here` into a file called `note.txt` inside
+          it, then start a second container with the same volume and print
+          the contents of the file.
+        kind: cli
+        entry_file: solve.sh
+        files:
+          solve.sh: |
+            #!/bin/sh
+            # Your commands here.
+            echo "not implemented yet"
+        setup:
+          - "docker volume rm -f trainer-data >/dev/null 2>&1 || true"
+          - "docker volume create trainer-data >/dev/null"
+        teardown:
+          - "docker volume rm -f trainer-data >/dev/null 2>&1 || true"
+        solution:
+          solve.sh: |
+            docker run --rm -v trainer-data:/data alpine:3.20 sh -c 'echo "still here" > /data/note.txt'
+            docker run --rm -v trainer-data:/data alpine:3.20 cat /data/note.txt
+        checks:
+          - name: the script's output
+            kind: script
+            command: sh solve.sh
+            settings:
+              scrub: true
+        cases:
+          - name: the default environment
+        hints:
+          - "`docker run -v trainer-data:/data alpine:3.20 ...` mounts the volume at `/data` inside the container."
+          - "The volume is created for you if it does not exist, so there is no need to create it first."
+          - "Run two containers: one to write the file, one to read it back."
+        teach: |
+          A named volume is storage the daemon owns, outside any
+          container. The daemon creates it on first use, keeps it after the
+          container is removed, and removes it only when you say so.
+
+          ```bash
+          docker volume create pgdata
+          docker volume ls
+          docker volume rm pgdata
+          docker run --rm -v pgdata:/var/lib/postgresql/data postgres:16
+          ```
+
+          The `-v` argument is `source:target`. The source is the volume's
+          name; the target is the path inside the container. A source that
+          is not an existing volume is created for you, which is why the
+          `docker volume create` above is a convenience rather than a
+          requirement.
+
+          The consequence that matters is the lifecycle. The container is
+          disposable and the volume is not: stop the container, remove it,
+          start a new one against the same volume, and the data is still
+          there. That is what makes a named volume the right place for a
+          database's files, and what makes `docker compose down` safe to
+          run without `--volumes`.
+        tags: [volumes, cli, operations]
+      - id: i-volumes-bind
+        title: Mount a host directory
+        prompt: |
+          The host directory `./data` holds a file called `host.txt`.
+
+          Bind-mount it into a container at `/mnt/data` and print the
+          contents of `/mnt/data/host.txt`.
+        kind: cli
+        entry_file: solve.sh
+        files:
+          solve.sh: |
+            #!/bin/sh
+            # Your commands here.
+            echo "not implemented yet"
+        setup:
+          - "mkdir -p data && echo 'from the host' > data/host.txt"
+        teardown:
+          - "rm -rf data"
+        solution:
+          solve.sh: |
+            docker run --rm -v "$(pwd)/data:/mnt/data" alpine:3.20 cat /mnt/data/host.txt
+        checks:
+          - name: the script's output
+            kind: script
+            command: sh solve.sh
+            settings:
+              scrub: true
+        cases:
+          - name: the default environment
+        hints:
+          - "A bind mount uses a path on the host: `-v /host/path:/container/path`."
+          - "The path has to be absolute, so `\"$(pwd)/data:/mnt/data\"` works from the directory the script runs in."
+          - "Add `:ro` to mount it read-only."
+        teach: |
+          A bind mount maps a path on the host into the container. The
+          container sees the host's files, at the same inode, with the
+          host's permissions -- it is not a copy.
+
+          ```bash
+          docker run --rm -v "$PWD/src:/app/src:ro" my-api:1.0.0
+          docker run --rm -v "$PWD/config.json:/etc/app/config.json:ro" my-api:1.0.0
+          ```
+
+          The path on the left has to be absolute. Docker resolves a
+          relative path against the daemon's working directory rather than
+          yours, which is a genuinely confusing failure, so `$(pwd)/...` is
+          the habit worth forming.
+
+          The `:ro` suffix mounts the path read-only. It is the right
+          default for anything the container only reads -- source code,
+          configuration, certificates -- and it turns a bug that would
+          have written to your working tree into an error.
+
+          A bind mount and a named volume are the same mechanism with a
+          different owner. The volume's storage belongs to Docker; the bind
+          mount's belongs to you. Use the volume for data the application
+          owns, and the bind mount for the things you want to edit from
+          the host.
+        tags: [volumes, cli, files]
+      - id: i-volumes-persistence
+        title: What survives and what does not
+        prompt: |
+          Show the difference between the two.
+
+          First, write `ephemeral` into `/tmp/note.txt` in a container and
+          let it exit. Then start a new container and report that the file
+          is gone.
+
+          Then write `persisted` into `/data/note.txt` in a container that
+          mounts the named volume `trainer-data`, and read it back from a
+          second container that mounts the same volume.
+
+          The script's output must be exactly:
+
+          ```
+          container filesystem is gone
+          persisted
+          ```
+        kind: cli
+        entry_file: solve.sh
+        files:
+          solve.sh: |
+            #!/bin/sh
+            # Your commands here.
+            echo "not implemented yet"
+        setup:
+          - "docker volume rm -f trainer-data >/dev/null 2>&1 || true"
+          - "docker volume create trainer-data >/dev/null"
+        teardown:
+          - "docker volume rm -f trainer-data >/dev/null 2>&1 || true"
+        solution:
+          solve.sh: |
+            docker run --rm alpine:3.20 sh -c 'echo "ephemeral" > /tmp/note.txt'
+            docker run --rm alpine:3.20 sh -c 'test -e /tmp/note.txt || echo "container filesystem is gone"'
+            docker run --rm -v trainer-data:/data alpine:3.20 sh -c 'echo "persisted" > /data/note.txt'
+            docker run --rm -v trainer-data:/data alpine:3.20 cat /data/note.txt
+        checks:
+          - name: the script's output
+            kind: script
+            command: sh solve.sh
+            settings:
+              scrub: true
+        cases:
+          - name: the default environment
+        hints:
+          - "The first container's filesystem goes away with the container, so a second container from the same image starts clean."
+          - "`test -e /tmp/note.txt || echo ...` prints the message only when the file is not there."
+          - "The volume's contents live outside the container, so the second container that mounts it still sees the file."
+        teach: |
+          A container's filesystem is the image's filesystem plus a writable
+          layer. The writable layer belongs to the container, and it is
+          discarded when the container is removed. A second container from
+          the same image starts from the same clean filesystem, whatever
+          the first one did.
+
+          A volume is outside all of that. The daemon keeps it, and every
+          container that mounts it sees the same files. That is the whole
+          difference, and it is the difference between a cache and a
+          database.
+
+          ```bash
+          # disposable
+          docker run --rm alpine:3.20 sh -c 'echo hello > /tmp/note.txt'
+
+          # durable
+          docker run --rm -v trainer-data:/data alpine:3.20 sh -c 'echo hello > /data/note.txt'
+          docker run --rm -v trainer-data:/data alpine:3.20 cat /data/note.txt
+          ```
+
+          The practical rule: if losing the file would lose data, it
+          belongs in a volume. If it is a cache, a build artefact or
+          anything the container can recreate, it does not, and leaving it
+          in the writable layer keeps the container cheap to start.
+        tags: [volumes, cli, layers]
+      - id: i-volumes-compose
+        title: A named volume in a compose file
+        prompt: |
+          The `db` service needs somewhere to keep its data that survives
+          the container.
+
+          Declare a named volume called `dbdata` in the compose file and
+          mount it into the `db` service at `/var/lib/data`.
+        kind: compose
+        entry_file: compose.yaml
+        files:
+          compose.yaml: |
+            services:
+              db:
+                image: alpine:3.20
+        solution:
+          compose.yaml: |
+            services:
+              db:
+                image: alpine:3.20
+                volumes:
+                  - dbdata:/var/lib/data
+            volumes:
+              dbdata:
+        checks:
+          - name: the project is configured as required
+            kind: config
+          - name: the volume is mounted in the container
+            kind: service
+            service: db
+            command: grep -c "/var/lib/data" /proc/mounts
+        cases:
+          - name: the default project
+        hints:
+          - "A service's `volumes:` key lists what is mounted where. A short entry that is just a name is a named volume."
+          - "The top-level `volumes:` key, next to `services:`, declares the named volumes the project uses."
+          - "A bind mount is an entry with a slash in it, like `./data:/var/lib/data`."
+        teach: |
+          Compose mounts are the same two things as `docker run -v`, written
+          in the same shorthand:
+
+          ```yaml
+          services:
+            db:
+              image: postgres:16
+              volumes:
+                - pgdata:/var/lib/postgresql/data   # a named volume
+                - ./init.sql:/docker-entrypoint-initdb.d/init.sql:ro   # a bind mount
+          volumes:
+            pgdata:
+          ```
+
+          The rule for telling them apart is the shape of the left-hand
+          side. A bare name is a named volume; anything with a path in it
+          is a bind mount.
+
+          The top-level `volumes:` key declares the named volumes. It is
+          not optional: a service may only mount a named volume the
+          project declares. Compose creates the volume if it does not
+          exist, and gives it a name prefixed with the project name, so
+          two projects on the same machine do not share one by accident.
+
+          `docker compose down` removes the containers and the network but
+          leaves the volumes, because the volume is the data and the
+          containers are the processes. `docker compose down --volumes`
+          removes the data too, and that is the command to be careful
+          with.
+        tags: [volumes, compose, config]

@@ -1,0 +1,152 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Progress · Docker Trainer</title>
+<link rel="stylesheet" href="/css/app.css">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><text y='26' font-size='26'>🐳</text></svg>">
+</head>
+<body>
+<header data-nav></header>
+
+<main class="wrap">
+  <div class="section-head" style="margin-top:32px">
+    <h1 style="margin:0">Progress</h1>
+    <span class="sub">
+      Solved and revealed are counted separately — a revealed exercise is not a solve.
+    </span>
+  </div>
+
+  <div class="stats" id="stats"></div>
+
+  <div class="section-head">
+    <h2>By track</h2>
+  </div>
+  <div class="grid grid-3" id="tracks"></div>
+
+  <div class="section-head">
+    <h2>Recent attempts</h2>
+    <span class="sub">Newest first.</span>
+  </div>
+  <div id="attempts"></div>
+
+  <div class="section-head">
+    <h2>Danger zone</h2>
+  </div>
+  <div class="card">
+    <p style="color:var(--text-muted);font-size:.9rem">
+      Clearing progress deletes every attempt and all solved/revealed state.
+      The curriculum itself is unaffected.
+    </p>
+    <button id="reset" class="btn-sm">Reset all progress</button>
+  </div>
+
+  <footer data-footer></footer>
+</main>
+
+<script type="module">
+import { api } from '/js/api.js';
+import { mountNav, mountFooter, loading, failure } from '/js/layout.js';
+import { el, mount } from '/js/dom.js';
+
+mountNav();
+mountFooter();
+
+const statsNode = document.getElementById('stats');
+const tracksNode = document.getElementById('tracks');
+const attemptsNode = document.getElementById('attempts');
+
+loading(statsNode, 'Loading progress...');
+refresh();
+
+async function refresh() {
+  try {
+    const [progress, curriculum] = await Promise.all([api.progress(), api.curriculum()]);
+    renderStats(progress.summary);
+    renderTracks(curriculum.tracks);
+    renderAttempts(progress.recent_attempts);
+  } catch (error) {
+    failure(statsNode, error);
+  }
+}
+
+function renderStats(summary) {
+  mount(statsNode,
+    stat(summary.total, 'Total'),
+    stat(summary.solved, 'Solved', 'success'),
+    stat(summary.revealed, 'Revealed', 'warning'),
+    stat(summary.attempted, 'Attempted'),
+    stat(summary.unsolved, 'Not started'),
+    stat(`${Math.round(summary.solve_rate * 100)}%`, 'Solve rate'),
+  );
+}
+
+function stat(value, label, cls = '') {
+  return el('div', { class: `stat ${cls}`.trim() }, [
+    el('div', { class: 'value', text: String(value) }),
+    el('div', { class: 'label', text: label }),
+  ]);
+}
+
+function renderTracks(tracks) {
+  mount(tracksNode, tracks.map((track) => {
+    let solved = 0, revealed = 0;
+    for (const lesson of track.lessons) {
+      for (const exercise of lesson.exercises) {
+        if (exercise.status === 'solved') solved += 1;
+        else if (exercise.status === 'revealed') revealed += 1;
+      }
+    }
+    const total = track.exercise_count || 1;
+    const pct = Math.round((solved / total) * 100);
+
+    return el('div', { class: 'card' }, [
+      el('div', { class: 'row', style: 'margin-bottom:8px' }, [
+        el('span', { class: `badge ${track.difficulty}`, text: track.difficulty }),
+      ]),
+      el('h3', { style: 'margin:0 0 10px' }, track.title),
+      el('div', { style: 'height:7px;background:var(--bg-inset);border-radius:999px;overflow:hidden' }, [
+        el('div', { style: `height:100%;width:${pct}%;background:var(--success)` }),
+      ]),
+      el('div', { class: 'result-meta', style: 'margin:9px 0 0' }, [
+        el('span', { text: `${solved} / ${track.exercise_count} solved` }),
+        revealed ? el('span', { style: 'color:var(--warning)' }, `${revealed} revealed`) : null,
+      ]),
+    ]);
+  }));
+}
+
+function renderAttempts(attempts) {
+  if (!attempts.length) {
+    mount(attemptsNode, el('div', { class: 'empty' }, 'No attempts yet. Open an exercise to get started.'));
+    return;
+  }
+
+  mount(attemptsNode, el('div', { class: 'table-scroll' }, el('table', { class: 'result' }, [
+    el('thead', {}, el('tr', {}, ['When', 'Exercise', 'Result', 'Cases', 'Time', 'Code'].map(
+      (h) => el('th', { text: h })))),
+    el('tbody', {}, attempts.map((a) => el('tr', {}, [
+      el('td', { text: a.created_at }),
+      el('td', {}, el('a', { href: `/exercise.html?id=${encodeURIComponent(a.exercise_id)}` }, a.exercise_id)),
+      el('td', {}, el('span', { class: `badge ${a.passed ? 'solved' : 'revealed'}` },
+        a.passed ? 'pass' : (a.error ? 'error' : 'fail'))),
+      el('td', { text: a.checks_total != null ? `${a.checks_passed}/${a.checks_total}` : '—' }),
+      el('td', { text: a.duration_ms != null ? `${Math.round(a.duration_ms)} ms` : '—' }),
+      el('td', { style: 'max-width:340px;overflow:hidden;text-overflow:ellipsis' },
+        el('span', { title: a.code }, (a.code || '').replace(/\s+/g, ' ').slice(0, 70) || a.error || '')),
+    ]))),
+  ])));
+}
+
+document.getElementById('reset').addEventListener('click', async (event) => {
+  if (!confirm('Delete every attempt and all progress? This cannot be undone.')) return;
+  const button = event.target;
+  button.disabled = true;
+  await api.resetProgress();
+  await refresh();
+  button.disabled = false;
+});
+</script>
+</body>
+</html>

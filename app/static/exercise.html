@@ -1,0 +1,311 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Exercise · Docker Trainer</title>
+<link rel="stylesheet" href="/css/app.css">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><text y='26' font-size='26'>🐳</text></svg>">
+</head>
+<body>
+<header data-nav></header>
+
+<main class="wrap">
+  <div id="page">
+    <div class="empty"><span class="spinner"></span> Loading exercise...</div>
+  </div>
+  <footer data-footer></footer>
+</main>
+
+<script type="module">
+import { api } from '/js/api.js';
+import { mountNav, mountFooter, loading, failure } from '/js/layout.js';
+import { renderRun, renderGrading, banner } from '/js/results.js';
+import { fileEditor } from '/js/files.js';
+import { mountMarkdown } from '/js/markdown.js';
+import { el, mount, $ } from '/js/dom.js';
+
+mountNav();
+mountFooter();
+
+const page = document.getElementById('page');
+const exerciseId = new URLSearchParams(location.search).get('id');
+
+if (!exerciseId) {
+  failure(page, new Error('No exercise id in the URL.'));
+} else {
+  load();
+}
+
+async function load() {
+  loading(page, 'Loading exercise...');
+  let exercise;
+  try {
+    exercise = await api.exercise(exerciseId);
+  } catch (error) {
+    failure(page, error);
+    return;
+  }
+
+  const parts = {
+    hints: el('div', { class: 'hidden', style: 'margin-bottom:14px' }),
+    grading: el('div', { style: 'margin-bottom:14px' }),
+    results: el('div'),
+  };
+
+  const editorHost = el('div');
+
+  const runBtn = el('button', { text: 'Build & run' });
+  const submitBtn = el('button', { class: 'btn-primary', text: 'Submit answer' });
+  const resetBtn = el('button', { class: 'btn-ghost btn-sm', text: 'Reset' });
+  const hintBtn = el('button', { class: 'btn-sm' }, `Hint (0/${exercise.hint_count})`);
+  const solutionBtn = el('button', { class: 'btn-sm btn-ghost' }, 'Show solution');
+
+  // Held in a slot so the header badge can be refreshed in place. Revealing a
+  // solution or solving the exercise changes the recorded state, and a badge
+  // that still says "Not started" until a reload is a small lie.
+  const statusSlot = el('span');
+  statusSlot.append(el('span', { class: `badge ${exercise.status}`, text: label(exercise.status) }));
+  const setStatus = (status) => {
+    statusSlot.replaceChildren(el('span', { class: `badge ${status}`, text: label(status) }));
+  };
+
+  mount(page, [
+    el('div', { class: 'row', style: 'margin:28px 0 4px' }, [
+      el('a', { href: '/practice.html', class: 'btn btn-ghost btn-sm' }, '← All exercises'),
+      el('span', { class: `badge ${exercise.difficulty}`, text: exercise.difficulty }),
+      el('span', { class: 'badge', text: kindLabel(exercise.kind) }),
+      statusSlot,
+      el('span', { class: 'spacer' }),
+    ]),
+    el('h1', { style: 'margin:10px 0 14px' }, exercise.title),
+    // The prompt is rendered as markdown, like the lesson body, so that
+    // inline code (`FROM alpine:3.20`) reads as code rather than as stray
+    // backticks.
+    el('div', { class: 'prose' }, []),
+
+    renderChecksNote(exercise),
+    renderCasesNote(exercise),
+
+    el('div', { class: 'card', style: 'margin-top:22px' }, [
+      el('div', { class: 'row', style: 'margin-bottom:10px' }, [
+        el('strong', { text: 'Your files' }),
+        el('span', { class: 'spacer' }),
+        el('span', { class: 'sub', style: 'font-size:.8rem' }, 'Ctrl + Enter to build'),
+      ]),
+      editorHost,
+      el('div', { class: 'row', style: 'margin-top:12px' }, [
+        runBtn,
+        submitBtn,
+        resetBtn,
+        el('span', { class: 'spacer' }),
+        hintBtn,
+        solutionBtn,
+      ]),
+    ]),
+
+    parts.hints,
+    parts.grading,
+    parts.results,
+
+    exercise.teach ? el('details', { class: 'card', style: 'margin-top:12px' }, [
+      el('summary', { style: 'cursor:pointer;font-weight:500' }, 'Why this works'),
+      el('div', { class: 'prose' }, []),
+    ]) : null,
+  ]);
+
+  mountMarkdown(page.querySelectorAll('.prose')[1], exercise.teach);
+  mountMarkdown(page.querySelectorAll('.prose')[0], exercise.prompt);
+
+  // The editor opens on the last submission if there was one, so a learner
+  // who comes back to an exercise finds their own work waiting.
+  const starter = exercise.last_files && Object.keys(exercise.last_files).length
+    ? exercise.last_files
+    : exercise.files;
+  const editor = fileEditor(editorHost, starter);
+
+  // ---- actions -----------------------------------------------------------
+
+  let hintsShown = 0;
+  let solutionShown = false;
+
+  function guard(button, fn) {
+    return async (...args) => {
+      const label = button.textContent;
+      button.disabled = true;
+      button.textContent = 'Working...';
+      try {
+        await fn(...args);
+      } catch (error) {
+        mount(parts.grading, banner('error', error.message));
+      } finally {
+        button.disabled = false;
+        button.textContent = label;
+      }
+    };
+  }
+
+  runBtn.addEventListener('click', guard(runBtn, run));
+  submitBtn.addEventListener('click', guard(submitBtn, submit));
+  resetBtn.addEventListener('click', () => {
+    editor.setFiles(exercise.files);
+    mount(parts.grading);
+    parts.results.replaceChildren();
+  });
+
+  hintBtn.addEventListener('click', guard(hintBtn, async () => {
+    if (hintsShown >= exercise.hint_count) return;
+    const hint = await api.hint(exerciseId, hintsShown);
+    parts.hints.classList.remove('hidden');
+    parts.hints.append(
+      el('div', { class: 'hint' }, [
+        el('span', { class: 'hint-index', text: `Hint ${hint.index + 1} of ${hint.total}` }),
+        hint.text,
+      ]),
+    );
+    hintsShown += 1;
+    hintBtn.textContent = `Hint (${hintsShown}/${exercise.hint_count})`;
+  }));
+
+  solutionBtn.addEventListener('click', guard(solutionBtn, async () => {
+    if (solutionShown && !confirm('Show it again?')) return;
+    const data = await api.reveal(exerciseId);
+    solutionShown = true;
+    solutionBtn.textContent = 'Solution shown';
+    solutionBtn.disabled = true;
+    setStatus(data.state.status);
+
+    const files = Object.entries(data.solution || {})
+      .map(([name, content]) => `${name}\n${'='.repeat(name.length)}\n${content}`)
+      .join('\n\n');
+
+    mount(parts.grading, [
+      banner('revealed', 'Solution revealed. This exercise is now recorded as revealed, not solved — your progress will show the difference.'),
+      el('pre', { class: 'output value', style: 'margin-top:12px' }, files),
+    ]);
+  }));
+
+  /** Explain what the scheduler did, in the learner's terms.
+   *
+   *  Silence here would leave "review" looking like a mystery feature: the
+   *  queue would fill up with no visible cause.
+   */
+  function reviewNote(review) {
+    const text = (() => {
+      if (review.scheduled && review.due_now) {
+        return 'This one is back in your review queue now — answer it again to push it further out.';
+      }
+      if (review.scheduled) {
+        const days = review.interval_days;
+        const when = days < 1
+          ? `${Math.max(1, Math.round(days * 24))} hours`
+          : `${Math.round(days)} day${Math.round(days) === 1 ? '' : 's'}`;
+        return `Added to your review schedule — it will come back in ${when}, then less often as you keep passing it.`;
+      }
+      if (review.reason === 'revealed') {
+        return 'Not scheduled for review, because you have seen the solution. Revealed exercises are tracked separately from solved ones.';
+      }
+      return 'Not scheduled yet — solving it (without revealing) will add it to your review schedule.';
+    })();
+    return el('p', { style: 'color:var(--text-muted);font-size:.875rem;margin:8px 0 0' }, text);
+  }
+
+  async function run() {
+    mount(parts.grading);
+    parts.results.replaceChildren(el('div', { class: 'empty' }, [el('span', { class: 'spinner' }), ' Building...']));
+    const result = await api.run(exerciseId, editor.getFiles());
+    parts.results.replaceChildren(renderRun(result));
+  }
+
+  async function submit() {
+    mount(parts.grading);
+    parts.results.replaceChildren(el('div', { class: 'empty' }, [el('span', { class: 'spinner' }), ' Checking...']));
+
+    const data = await api.submit(exerciseId, editor.getFiles());
+
+    if (!data.ok) {
+      parts.results.replaceChildren();
+      mount(parts.grading, banner(data.error.kind, data.error.message));
+      if (data.result && data.result.build_log) {
+        parts.results.replaceChildren(
+          el('pre', { class: 'output' }, data.result.build_log),
+        );
+      }
+      return;
+    }
+
+    setStatus(data.state.status);
+
+    const grading = data.grading;
+    const messages = [];
+
+    if (grading.passed) {
+      messages.push(banner('success', data.state.status === 'revealed'
+        ? 'Correct — but you had already opened the solution, so this is recorded as revealed rather than solved.'
+        : 'Correct. Nicely done.'));
+    } else {
+      messages.push(banner('warn', grading.detail || 'Not quite right.'));
+    }
+
+    if (data.review) messages.push(reviewNote(data.review));
+
+    mount(parts.grading, messages);
+
+    const diff = renderGrading(grading);
+    if (diff) parts.grading.append(diff);
+
+    parts.results.replaceChildren(renderRun(data.result || {}));
+
+    if (data.state.status === 'solved') {
+      // `nextUrl` is async, so the href cannot be set inline -- assigning a
+      // Promise would silently produce href="[object Promise]".
+      const nextLink = el('a', { class: 'btn btn-sm', href: '#' }, 'Next exercise →');
+      nextUrl().then((url) => { nextLink.href = url; });
+      parts.grading.append(el('div', { class: 'row', style: 'margin-top:12px' }, nextLink));
+    }
+  }
+
+  async function nextUrl() {
+    const data = await api.curriculum();
+    const flat = data.tracks.flatMap((t) => t.lessons.flatMap((l) => l.exercises));
+    const index = flat.findIndex((ex) => ex.id === exerciseId);
+    const next = flat[index + 1];
+    return next ? `/exercise.html?id=${encodeURIComponent(next.id)}` : '/progress.html';
+  }
+}
+
+function label(status) {
+  return { solved: 'Solved', revealed: 'Revealed', unsolved: 'Not started' }[status] || 'Not started';
+}
+
+function kindLabel(kind) {
+  return { image: 'Dockerfile', compose: 'Compose', cli: 'CLI' }[kind] || kind;
+}
+
+/** Tell the learner exactly what is being checked.
+ *
+ *  An exercise that grades you without saying what it looks at is a
+ *  guessing game, and guessing is not a skill this course is trying to
+ *  teach.
+ */
+function renderChecksNote(exercise) {
+  if (!exercise.checks || !exercise.checks.length) return null;
+  return el('div', { class: 'call-note' }, [
+    el('strong', {}, 'What is checked:'),
+    el('ul', { style: 'margin:8px 0 0;padding-left:20px' },
+      exercise.checks.map((c) => el('li', {}, c.name))),
+  ]);
+}
+
+/** Tell the learner how many times the artefact is built and run. */
+function renderCasesNote(exercise) {
+  if (!exercise.cases || exercise.cases.length <= 1) return null;
+  return el('div', { class: 'call-note' }, [
+    el('strong', {}, `Your files are built ${exercise.cases.length} times:`),
+    el('ul', { style: 'margin:8px 0 0;padding-left:20px' },
+      exercise.cases.map((c, i) => el('li', {}, `Case ${i + 1}: ${c.label}`))),
+  ]);
+}
+</script>
+</body>
+</html>

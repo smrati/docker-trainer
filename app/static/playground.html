@@ -1,0 +1,99 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Playground · Docker Trainer</title>
+<link rel="stylesheet" href="/css/app.css">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><text y='26' font-size='26'>🐳</text></svg>">
+</head>
+<body>
+<header data-nav></header>
+
+<main class="wrap">
+  <div class="section-head" style="margin-top:32px">
+    <h1 style="margin:0">Playground</h1>
+    <span class="sub">A workbench. Nothing is graded and nothing is recorded.</span>
+  </div>
+
+  <div class="card">
+    <div class="row" style="margin-bottom:10px">
+      <strong>Your Dockerfile</strong>
+      <span class="spacer"></span>
+      <span style="color:var(--text-faint);font-size:.8125rem">
+        Ctrl + Enter to build
+      </span>
+    </div>
+    <div class="editor-shell">
+      <div class="editor-bar">
+        <span>Dockerfile</span>
+        <span class="spacer"></span>
+        <span>Built and run with no network, a 512 MB memory cap and a process limit</span>
+      </div>
+      <textarea id="editor" class="code-editor" style="min-height:220px"
+        spellcheck="false" autocapitalize="off" autocomplete="off" autocorrect="off"
+>FROM alpine:3.20
+
+RUN echo "hello from the playground" &gt; /message.txt
+
+CMD ["cat", "/message.txt"]</textarea>
+    </div>
+    <div class="row" style="margin-top:12px">
+      <button id="run" class="btn-primary">Build &amp; run</button>
+      <span style="color:var(--text-faint);font-size:.8125rem">
+        The image is built for real and thrown away afterwards.
+      </span>
+    </div>
+  </div>
+
+  <details class="card" style="margin-top:14px">
+    <summary style="cursor:pointer;font-weight:500">Extra files</summary>
+    <p style="color:var(--text-muted);font-size:.875rem;margin-top:8px">
+      Any other files your Dockerfile copies. They go into the build context
+      beside the <code>Dockerfile</code>.
+    </p>
+    <div id="files"></div>
+  </details>
+
+  <div id="results" style="margin-top:18px"></div>
+
+  <footer data-footer></footer>
+</main>
+
+<script type="module">
+import { api } from '/js/api.js';
+import { mountNav, mountFooter, enhanceEditor } from '/js/layout.js';
+import { renderRun, banner } from '/js/results.js';
+import { fileEditor } from '/js/files.js';
+import { el, mount, $ } from '/js/dom.js';
+
+mountNav();
+mountFooter();
+
+const editor = $('#editor');
+const results = $('#results');
+const runBtn = $('#run');
+
+const files = fileEditor($('#files'), { 'extra.txt': 'a file in the build context\n' });
+
+async function run() {
+  const label = runBtn.textContent;
+  runBtn.disabled = true;
+  runBtn.textContent = 'Building...';
+  mount(results, el('div', { class: 'empty' }, [el('span', { class: 'spinner' }), ' Building...']));
+  try {
+    const result = await api.playground(editor.value, files.getFiles());
+    mount(results, renderRun(result));
+  } catch (error) {
+    mount(results, banner('error', error.message));
+  } finally {
+    runBtn.disabled = false;
+    runBtn.textContent = label;
+  }
+}
+
+runBtn.addEventListener('click', run);
+enhanceEditor(editor, run, null);
+</script>
+</body>
+</html>

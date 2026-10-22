@@ -1,0 +1,2196 @@
+id: foundations
+title: Foundations
+description: >-
+  Images, containers, and the Dockerfile instructions you will use every day.
+  Start here if you have never written a Dockerfile, or if you write one but
+  could not explain what its layers do.
+difficulty: beginner
+order: 1
+lessons:
+  - id: f-images-and-containers
+    title: Images and containers
+    summary: What an image is, what a container is, and how one becomes the other.
+    body: |
+      # Images and containers
+
+      An **image** is a filesystem plus a set of instructions for how to run
+      it. It is inert: it does nothing until something runs it.
+
+      A **container** is a running instance of an image. It has its own
+      process, its own network namespace, and its own writable layer on top
+      of the image's filesystem.
+
+      ## The one-liner
+
+      ```bash
+      docker run alpine:3.20 echo hello
+      ```
+
+      That does three things: it pulls `alpine:3.20` if it is not already on
+      this machine, creates a container from it, and runs `echo hello` in it.
+      The container is removed when the command exits, because `--rm` was
+      implied by the fact that there was nothing to keep.
+
+      ## Images are referred to by tag
+
+      `alpine:3.20` is a *tag*: a name pointing at a specific image. The
+      tag `latest` is just a convention, not a magic value, and an image
+      built without a tag gets `latest` by default. Two different builds
+      can carry the same tag, which is exactly why an exercise about
+      reproducibility will insist you do not use it.
+
+      ## What you can see
+
+      ```bash
+      docker images        # what is on this machine
+      docker ps            # what is running right now
+      docker ps -a         # what has ever run
+      ```
+
+      `docker ps` shows a `STATUS` column that reads `Up 3 seconds` or
+      `Exited (0) 2 minutes ago`. The number in parentheses is the exit
+      code. A container that exited with `0` finished successfully; anything
+      else is a failure.
+
+      > **Callout**
+      > An image is a template, a container is an instance. Deleting a
+      > container does not delete the image it came from, and you can run
+      > many containers from one image.
+
+      ## What this lesson is not
+
+      This lesson does not teach you to write a Dockerfile. The next lesson
+      does. This one is about the vocabulary the rest of the course assumes.
+    exercises:
+      - id: f-run-a-container
+        title: Run a container and print a greeting
+        prompt: |
+          Write a Dockerfile that builds an image which, when run with no
+          arguments, prints the single line `hello from docker`.
+
+          The image must be based on `alpine:3.20`. The command runs inside
+          the container, so a shell is available.
+        kind: image
+        entry_file: Dockerfile
+        files:
+          Dockerfile: |
+            # Your Dockerfile here.
+            FROM alpine:3.20
+
+            CMD ["echo", "hello from docker"]
+        solution:
+          Dockerfile: |
+            FROM alpine:3.20
+
+            CMD ["echo", "hello from docker"]
+        checks:
+          - name: running the image prints the greeting
+            kind: default
+        cases:
+          - name: the default run
+        hints:
+          - Start with `FROM alpine:3.20`, then add a `CMD` that runs `echo`.
+          - The exec form is `CMD ["echo", "hello from docker"]` -- a JSON
+            array, not a shell string.
+          - The check runs the image the way `docker run <image>` would, so
+            it sees whatever your `CMD` starts.
+        teach: |
+          `FROM` chooses the base image. `CMD` says what to run when the
+          container starts with no arguments.
+
+          The exec form -- `CMD ["echo", "hello from docker"]` -- passes the
+          arguments straight to the program, with no shell in between. The
+          shell form -- `CMD echo "hello from docker"` -- runs the line
+          through `/bin/sh -c`, which means the shell interprets it and
+          signal handling works differently. The exec form is the better
+          default, and it is the one Docker's own documentation uses.
+
+          The check runs the image with *its own* command, the way
+          `docker run <image>` would, rather than overriding it. That is the
+          only way to find out what an image really does when it is started.
+        tags: [dockerfile, commands]
+      - id: f-one-layer
+        title: Combine two commands into one layer
+        prompt: |
+          The image below runs two commands in two separate layers. Each `RUN`
+          instruction creates a layer, and every layer is another thing the
+          daemon has to store and ship.
+
+          Rewrite the Dockerfile so that the image ends up with **one** layer
+          for your commands rather than two, and still prints `done` when it
+          runs.
+
+          Keep the base image as `alpine:3.20`.
+        kind: image
+        entry_file: Dockerfile
+        files:
+          Dockerfile: |
+            FROM alpine:3.20
+
+            RUN echo "working" > /status.txt
+
+            RUN echo "done" >> /status.txt
+
+            CMD ["cat", "/status.txt"]
+        solution:
+          Dockerfile: |
+            FROM alpine:3.20
+
+            RUN echo "working" > /status.txt && \
+                echo "done" >> /status.txt
+
+            CMD ["cat", "/status.txt"]
+        checks:
+          - name: the image has only one layer for the commands
+            kind: inspect
+            template: "{{len .RootFS.Layers}}"
+          - name: running the image prints both lines
+            kind: default
+        cases:
+          - name: the default run
+        hints:
+          - Two `RUN` instructions make two layers. One `RUN` with two
+            commands makes one.
+          - The two commands have to run in the same shell, so the second
+            one must still be able to see `/status.txt`.
+          - A backslash at the end of the line continues the instruction onto
+            the next one.
+        teach: |
+          Every instruction in a Dockerfile that changes the filesystem
+          creates a layer. Layers are stored as differences, so
+          `RUN echo a` followed by `RUN echo b` produces two layers, while
+          `RUN echo a && echo b` produces one.
+
+          The layers are not just a tidiness question. A layer that only ever
+          *adds* files cannot be undone by a later layer -- `rm` inside a
+          container hides a file, but the bytes are still in the layer below.
+          That is why the advice is to install packages and delete them in
+          the *same* `RUN`, rather than in two.
+
+          The `\` at the end of a line continues the instruction. It is the
+          Dockerfile's own line-continuation, not a shell one: the shell sees
+          `echo "working" > /status.txt && echo "done" >> /status.txt` as a
+          single command.
+
+          The check here counts the image's layers. The base image
+          contributes one, so the reference has two and a version with two
+          separate `RUN` instructions has three.
+        tags: [layers, optimisation]
+      - id: f-build-argument
+        title: Bake a version in with a build argument
+        prompt: |
+          Write a Dockerfile that takes a build argument called `VERSION` and
+          bakes it into the image as an environment variable called
+          `APP_VERSION`.
+
+          The image must print `version <VERSION>` when it runs, where
+          `<VERSION>` is whatever was passed to the build.
+
+          The grader builds your image twice: once with `VERSION=1.0.0` and
+          once with `VERSION=2.0.0`. Both have to print the right thing, so
+          the version has to be fixed **at build time**, not read at run time.
+        kind: image
+        entry_file: Dockerfile
+        files:
+          Dockerfile: |
+            FROM alpine:3.20
+
+            # Declare a build argument, then use it.
+            ARG VERSION=dev
+
+            CMD ["sh", "-c", "echo version ${APP_VERSION}"]
+        solution:
+          Dockerfile: |
+            FROM alpine:3.20
+
+            ARG VERSION=dev
+
+            ENV APP_VERSION=${VERSION}
+
+            CMD ["sh", "-c", "echo version ${APP_VERSION}"]
+        checks:
+          - name: the image prints the version it was built with
+            kind: default
+        cases:
+          - name: version 1.0.0
+            build_args:
+              VERSION: "1.0.0"
+          - name: version 2.0.0
+            build_args:
+              VERSION: "2.0.0"
+        hints:
+          - "`ARG` declares a value that only exists during the build; `ENV` declares one that is baked into the image."
+          - "An `ENV` can be set from an `ARG`: `ENV APP_VERSION=${VERSION}`."
+          - "`ARG` values do not survive into the running container unless you turn them into an `ENV`."
+        teach: |
+          `ARG` and `ENV` look similar and are not.
+
+          | | `ARG` | `ENV` |
+          | --- | --- | --- |
+          | Exists during the build | yes | yes |
+          | Exists at run time | no | yes |
+          | Visible in `docker history` | no | yes |
+          | Can be overridden with `--build-arg` | yes | no |
+
+          The order matters too. An `ARG` is only in scope from the line it is
+          declared on until the end of the build stage, and it must be
+          declared before the instruction that uses it.
+
+          Baking the version in with `ENV APP_VERSION=${VERSION}` rather than
+          reading it at run time is the difference between an image that says
+          what it is and an image that could say anything. The two cases here
+          build the same Dockerfile with different arguments, and each image
+          reports its own version.
+        tags: [config, images]
+      - id: f-tag-an-image
+        title: Build an image and give it a tag
+        prompt: |
+          A tag is the name an image is known by. Write `solve.sh` so that it
+
+          1. builds the image in this directory with the tag
+             `trainer-demo:1.0`;
+          2. prints that tag on a line of its own, exactly as `docker images`
+             reports it;
+          3. runs the image and prints what the container prints.
+
+          The directory already holds a `Dockerfile` whose container prints
+          `tagged`. Do not change it.
+        kind: cli
+        entry_file: solve.sh
+        setup:
+          - "printf '%s\\n' 'FROM alpine:3.20' 'CMD [\"echo\",\"tagged\"]' > Dockerfile"
+        teardown:
+          - "docker image rm -f trainer-demo:1.0"
+        files:
+          solve.sh: |
+            # Build the image with the tag trainer-demo:1.0, print the tag
+            # exactly as docker images reports it, then run the image and
+            # print what it prints.
+        solution:
+          solve.sh: |
+            docker build -t trainer-demo:1.0 . > /dev/null
+            docker images --filter reference=trainer-demo:1.0 --format '{{.Repository}}:{{.Tag}}'
+            docker run --rm trainer-demo:1.0
+        checks:
+          - name: the script's output
+            kind: script
+            command: sh solve.sh
+        cases:
+          - name: the default run
+        hints:
+          - "`docker build -t trainer-demo:1.0 .` builds the image in the current directory and gives it the tag."
+          - "`docker images --filter reference=trainer-demo:1.0` lists the images carrying that tag; `--format` chooses what each line contains."
+          - "`docker run --rm trainer-demo:1.0` runs the image and prints whatever the container prints."
+        teach: |
+          A tag is a mutable pointer to an image, not the image itself. Two
+          tags can point at the same image, and building again under a tag
+          you have used before moves that tag to the new image and leaves the
+          old one dangling. That is why `docker images` sometimes shows
+          `<none>` in the repository column: nothing points at those bytes
+          any more, and they are waiting to be pruned.
+
+          `docker build -t name:tag .` is the whole of it. The `.` is the
+          build context -- the directory whose contents are sent to the
+          daemon -- and the tag is the name the result is filed under.
+
+          `docker images --filter reference=name:tag` narrows the list to
+          one image, and `--format` decides what each line looks like. The
+          templates are Go templates: `{{.Repository}}`, `{{.Tag}}`,
+          `{{.ID}}`, `{{.Size}}`, `{{.CreatedSince}}`. The image ID is a
+          content hash, so two tags on the same image show the same ID.
+
+          Reading the tag back is not ceremony. A tag is how you refer to an
+          artefact for the rest of its life -- in a `docker run`, in a
+          compose file, in a deployment -- so knowing exactly which tag
+          points at which bytes is worth being able to do by hand.
+        tags: [images, cli]
+      - id: f-inspect-an-image
+        title: Read an image's configuration
+        prompt: |
+          An image carries more than files. It also carries a configuration:
+          the ports it exposes, the user it runs as, the directory it starts
+          in, the variables it sets, the labels attached to it.
+
+          Write a Dockerfile based on `alpine:3.20` that
+
+          * exposes port `8080`;
+          * runs as the user `nobody`;
+          * starts in the directory `/app`;
+          * sets the environment variable `APP_ENV` to `production`;
+          * labels the image `org.opencontainers.image.title=demo`;
+          * prints `demo` when it runs.
+
+          `docker image inspect` is how you read all of that back.
+        kind: image
+        entry_file: Dockerfile
+        files:
+          Dockerfile: |
+            FROM alpine:3.20
+
+            # EXPOSE 8080
+            # USER nobody
+            # WORKDIR /app
+            # ENV APP_ENV=production
+            # LABEL org.opencontainers.image.title=demo
+
+            CMD ["echo", "demo"]
+        solution:
+          Dockerfile: |
+            FROM alpine:3.20
+
+            EXPOSE 8080
+            USER nobody
+            WORKDIR /app
+            ENV APP_ENV=production
+            LABEL org.opencontainers.image.title=demo
+
+            CMD ["echo", "demo"]
+        checks:
+          - name: the image exposes port 8080
+            kind: inspect
+            template: "{{json .Config.ExposedPorts}}"
+          - name: the image runs as nobody
+            kind: inspect
+            template: "{{json .Config.User}}"
+          - name: the image starts in /app
+            kind: inspect
+            template: "{{.Config.WorkingDir}}"
+          - name: the image is labelled demo
+            kind: inspect
+            template: '{{index .Config.Labels "org.opencontainers.image.title"}}'
+          - name: the container starts in /app
+            kind: run
+            command: pwd
+          - name: the container runs as nobody
+            kind: run
+            command: whoami
+          - name: the image sets APP_ENV
+            kind: run
+            command: printenv APP_ENV
+          - name: running the image prints demo
+            kind: default
+        cases:
+          - name: the default run
+        hints:
+          - "`EXPOSE`, `USER`, `WORKDIR`, `ENV` and `LABEL` all set fields in the image's configuration, and none of them changes a file."
+          - "`EXPOSE` takes a port number. `LABEL` takes a key and a value, like `LABEL org.opencontainers.image.title=demo`."
+          - "The configuration is not decoration: the container starts in `/app` and runs as `nobody` because the image says so."
+        teach: |
+          `docker image inspect` reads an image's configuration; the
+          filesystem is a separate thing. The configuration is what the
+          container starts with -- its working directory, its user, its
+          environment, its command -- and it is set by instructions that
+          never touch a file.
+
+          The useful templates are `{{json .Config.ExposedPorts}}`,
+          `{{json .Config.User}}`, `{{json .Config.Entrypoint}}`,
+          `{{json .Config.Cmd}}`, `{{json .Config.Env}}`,
+          `{{.Config.WorkingDir}}` and `{{.Size}}`. For a single label, Go's
+          `index` reaches into the map: `{{index .Config.Labels
+          "org.opencontainers.image.title"}}`.
+
+          Two of these checks are about the *runtime* rather than the
+          metadata: the container's working directory and its user come from
+          the image's configuration, so `WORKDIR` and `USER` are not
+          documentation -- they are what the process gets.
+
+          `EXPOSE` is the one to be careful about. It publishes nothing by
+          itself; it records an intention, and a container still needs
+          `-p` to publish a port on the host. It exists so that other
+          tooling -- compose, orchestrators, documentation generators -- can
+          read the image's contract without guessing.
+        tags: [images, config]
+  - id: f-dockerfile-basics
+    title: Dockerfile basics
+    summary: The instructions you will use every day, and the two phases they belong to.
+    body: |
+      # Dockerfile basics
+
+      A Dockerfile is a list of instructions, read from top to bottom, each
+      one adding something to the image. There are two phases, and keeping
+      them apart is the most useful thing to know about the format.
+
+      * **Build time.** `RUN`, `COPY` and `ADD` execute while the image is
+        built. Their output is frozen into a layer.
+      * **Run time.** `CMD` and `ENTRYPOINT` are recorded in the image's
+        configuration and run later, every time a container starts.
+
+      ## The instructions you will use every day
+
+      | Instruction | What it does | When it runs |
+      | --- | --- | --- |
+      | `FROM` | picks the base image | build time |
+      | `RUN` | runs a command, keeps the result | build time |
+      | `COPY` | copies files out of the build context | build time |
+      | `WORKDIR` | sets the working directory | build and run time |
+      | `ENV` | sets an environment variable | build and run time |
+      | `ARG` | declares a build argument | build time only |
+      | `CMD` | the default command | run time |
+      | `ENTRYPOINT` | the program to run | run time |
+
+      ## A first Dockerfile
+
+      ```dockerfile
+      FROM alpine:3.20
+
+      WORKDIR /app
+      COPY notes.txt ./
+      RUN cat notes.txt > /app/readme
+
+      CMD ["cat", "/app/readme"]
+      ```
+
+      Every instruction after `FROM` operates on the image built so far.
+      `WORKDIR` creates the directory if it is not there, `COPY` puts files
+      into it, and `RUN` sees both.
+
+      > **Callout**
+      > The build context is the directory you run `docker build` in -- not
+      > the directory the Dockerfile happens to sit in. Everything in that
+      > directory is sent to the daemon before the build starts, which is
+      > why a `.dockerignore` matters even for files you never name.
+
+      ## Two phases, one image
+
+      The `RUN` above happened once, when the image was built. The `CMD`
+      happens every time a container starts. An image holding a compiled
+      binary and a `CMD` that runs it does not recompile anything when it
+      starts; it runs what was baked in.
+
+      Which side a setting belongs on is a real decision. A version number
+      baked in with `ENV` describes the artefact and cannot lie about it; a
+      version read from the environment at run time describes the deployment
+      and can be changed without rebuilding. Neither is right by default.
+
+      ## Instruction order is the semantics
+
+      The instructions run in the order you write them, and each one sees
+      only what the earlier ones produced. A `RUN` that reads a file has to
+      come after the `COPY` that put the file there -- there is no second
+      pass, and no dependency resolution.
+    exercises:
+      - id: f-from-and-run
+        title: Run a command while the image is built
+        prompt: |
+          Write a Dockerfile based on `alpine:3.20` that runs a command
+          during the build to create the file `/etc/build-info`, containing
+          the single line `built by docker`.
+
+          When the container runs, it must print that line. The file has to
+          be in the image -- reading a file that only exists on your own
+          machine will not do.
+        kind: image
+        entry_file: Dockerfile
+        files:
+          Dockerfile: |
+            FROM alpine:3.20
+
+            # Create /etc/build-info here, then print it when the container runs.
+        solution:
+          Dockerfile: |
+            FROM alpine:3.20
+
+            RUN echo "built by docker" > /etc/build-info
+
+            CMD ["cat", "/etc/build-info"]
+        checks:
+          - name: the file is in the image
+            kind: run
+            command: cat /etc/build-info
+          - name: running the image prints the line
+            kind: default
+        cases:
+          - name: the default run
+        hints:
+          - "`RUN` executes a command while the image is being built, and whatever it writes stays in the image."
+          - "A `RUN` with a single command runs through `/bin/sh -c`, so `>` and `echo` work as usual."
+          - "`CMD` decides what happens when the container starts; it has to point at the file you created."
+        teach: |
+          `RUN` is the build phase and `CMD` is the run phase, and the
+          difference shows up in how you test them. `RUN echo x > f` happens
+          exactly once, when the image is built; the file it leaves behind is
+          part of the image, byte for byte, forever. `CMD` happens every
+          time a container is started from that image.
+
+          That is why a file written by `RUN` can be read by the container
+          and a file written on your workstation cannot. The container sees
+          the image's filesystem and nothing else -- no host paths, no
+          uncommitted changes.
+
+          `RUN` runs through `/bin/sh -c`, so redirections, pipes and `&&`
+          all work. The command runs as `root` unless the image says
+          otherwise, which is what lets a build step write to `/etc` in the
+          first place.
+        tags: [dockerfile, images]
+      - id: f-copy-into-the-image
+        title: Copy a file into the image
+        prompt: |
+          The build context holds a file called `message.txt`. Write a
+          Dockerfile based on `alpine:3.20` that copies it into the image at
+          `/app/message.txt`, unchanged.
+
+          When the container runs, it must print the contents of that file.
+
+          `COPY` reads from the build context, which is the directory the
+          build is run from -- not from the image and not from the
+          internet.
+        kind: image
+        entry_file: Dockerfile
+        files:
+          message.txt: |
+            hello from the context
+          Dockerfile: |
+            FROM alpine:3.20
+
+            # Copy message.txt from the build context to /app/message.txt,
+            # then print it when the container runs.
+        solution:
+          message.txt: |
+            hello from the context
+          Dockerfile: |
+            FROM alpine:3.20
+
+            COPY message.txt /app/message.txt
+
+            CMD ["cat", "/app/message.txt"]
+        checks:
+          - name: the file is in the image
+            kind: run
+            command: cat /app/message.txt
+          - name: running the image prints the contents
+            kind: default
+        cases:
+          - name: the default run
+        hints:
+          - "`COPY` takes a source path from the build context and a destination path inside the image."
+          - "The destination is a path in the image, not on your machine -- `/app/message.txt` means the root of the image's filesystem."
+          - "Leave `message.txt` as it is; the check compares what ends up in the image with the file you were given."
+        teach: |
+          `COPY` is how a file gets from your working copy into the image.
+          The source is resolved against the build context -- the directory
+          you named on the `docker build` command line -- and the destination
+          is a path inside the image.
+
+          The two halves of the instruction live in different filesystems,
+          and that trips people up regularly. `COPY message.txt
+          /app/message.txt` means "take `message.txt` from the context and
+          put it at `/app/message.txt` in the image". A destination without
+          a leading slash is relative to the image's working directory, which
+          is `/` unless a `WORKDIR` says otherwise.
+
+          `COPY` also creates the destination directory if it is missing,
+          which is why the file can land in `/app` without an `mkdir` first.
+
+          Copying is not free. Every `COPY` adds a layer, and the layer
+          holds the file's contents -- so a `COPY` of a file you are about to
+          overwrite still costs you the bytes of the original.
+        tags: [dockerfile, files]
+      - id: f-workdir
+        title: Set the working directory
+        prompt: |
+          Write a Dockerfile based on `alpine:3.20` whose working directory
+          is `/app`, both while the image is built and when the container
+          runs.
+
+          The build must create the file `/app/hello.txt` containing `hi`,
+          and the container must print that file's contents when it runs.
+
+          Use a relative path for the file the build creates, so that the
+          working directory is what puts it in the right place.
+        kind: image
+        entry_file: Dockerfile
+        files:
+          Dockerfile: |
+            FROM alpine:3.20
+
+            # Set the working directory to /app, create hello.txt there,
+            # and print it when the container runs.
+        solution:
+          Dockerfile: |
+            FROM alpine:3.20
+
+            WORKDIR /app
+
+            RUN echo "hi" > hello.txt
+
+            CMD ["cat", "hello.txt"]
+        checks:
+          - name: the image starts in /app
+            kind: inspect
+            template: "{{.Config.WorkingDir}}"
+          - name: the container starts in /app
+            kind: run
+            command: pwd
+          - name: the file is in /app
+            kind: run
+            command: cat /app/hello.txt
+          - name: running the image prints the contents
+            kind: default
+        cases:
+          - name: the default run
+        hints:
+          - "`WORKDIR /app` sets the directory for the instructions that follow it, and for the container at run time."
+          - "With `WORKDIR /app` in place, the relative path `hello.txt` means `/app/hello.txt`."
+          - "A `RUN` that creates the file and a `CMD` that reads it must agree on where the file is; relative paths make that automatic."
+        teach: |
+          `WORKDIR` does two things, and the second one is the one people
+          forget. During the build it sets the directory the following
+          instructions run in, and it is recorded in the image's
+          configuration, so every container started from that image starts
+          there too.
+
+          Because the working directory applies at build time as well, a
+          relative path in a `RUN` and the same relative path in a `CMD`
+          refer to the same place. That is the reason to prefer them over
+          absolute paths scattered through a Dockerfile: the paths follow
+          the directory instead of having to be kept in step by hand.
+
+          `WORKDIR` creates the directory if it does not exist, and it
+          changes the ownership of that directory if it does. It also adds a
+          layer of its own, which matters when you are counting them.
+
+          The `pwd` check is the runtime half: `docker run` uses the image's
+          working directory unless you override it with `--workdir`.
+        tags: [dockerfile, config]
+      - id: f-cmd-and-env
+        title: Bake a variable in and print it
+        prompt: |
+          Write a Dockerfile based on `alpine:3.20` that sets the
+          environment variable `APP_ENV` to `production`, and prints
+          `production` when the container runs.
+
+          The variable must be part of the image, not something the container
+          is told at run time -- the check reads it out of the image's
+          configuration as well as running the image.
+        kind: image
+        entry_file: Dockerfile
+        files:
+          Dockerfile: |
+            FROM alpine:3.20
+
+            # Set APP_ENV=production here, and print it when the container runs.
+        solution:
+          Dockerfile: |
+            FROM alpine:3.20
+
+            ENV APP_ENV=production
+
+            CMD ["sh", "-c", "echo $APP_ENV"]
+        checks:
+          - name: the image sets the variable
+            kind: run
+            command: printenv APP_ENV
+          - name: running the image prints the value
+            kind: default
+        cases:
+          - name: the default run
+        hints:
+          - "`ENV APP_ENV=production` puts the variable in the image's configuration, where it stays."
+          - "The exec form of `CMD` does not expand variables; run the command through `sh -c` if you want the shell to expand it."
+          - "`printenv APP_ENV` reads the variable out of the running container's environment."
+        teach: |
+          `ENV` writes a variable into the image's configuration. From the
+          line it appears on, every later `RUN` sees it, and every container
+          started from the image has it -- which is why `printenv` inside
+          the container finds it and why `docker image inspect` lists it
+          under `Config.Env`.
+
+          The exec form of `CMD` does not expand anything. `CMD ["echo",
+          "$APP_ENV"]` passes the four characters `$APP_ENV` to `echo`,
+          because there is no shell to expand them. Handing the command to
+          `sh -c` puts a shell in the way, and the shell does the
+          expansion -- at run time, from the environment the container
+          actually has.
+
+          That distinction is the reason both forms exist. The exec form is
+          the default because it hands the program exactly the arguments you
+          wrote. The shell form is what you reach for when the command
+          genuinely needs a shell: pipes, redirections, globbing, variable
+          expansion.
+
+          Note also that `ENV` is part of the image, not of the container.
+          `docker run --rm -e APP_ENV=staging` overrides it for one
+          container and leaves the image alone.
+        tags: [dockerfile, config]
+  - id: f-layers-and-caching
+    title: Layers and the build cache
+    summary: What a layer is, what invalidates the cache, and how to keep it.
+    body: |
+      # Layers and the build cache
+
+      An image is not one big filesystem. It is a stack of layers, each one
+      the difference between the image before it and the image after it.
+      Docker will tell you how many there are:
+
+      ```bash
+      docker image inspect --format '{{len .RootFS.Layers}}' myimage:1.0
+      ```
+
+      ## What makes a layer
+
+      | Instruction | Adds a layer |
+      | --- | --- |
+      | `RUN` | yes |
+      | `COPY`, `ADD` | yes |
+      | `WORKDIR` | yes |
+      | `ENV`, `LABEL`, `EXPOSE`, `USER`, `CMD` | no |
+
+      `WORKDIR` is the odd one out. It changes no files, but Docker still
+      records it as a layer of its own.
+
+      ## Layers are immutable
+
+      A layer can only *add*. If a later layer deletes a file, that file is
+      gone from the final image -- but its bytes are still in the layer
+      underneath, and the image stays exactly as big as it was.
+
+      Deleting a build tool in a second `RUN` does not make the image
+      smaller. Creating it and deleting it in the *same* `RUN` does, because
+      the file never enters a layer at all.
+
+      ## What invalidates the cache
+
+      The cache is per instruction. Docker reuses a layer only when the
+      instruction and everything it depends on are unchanged:
+
+      * a `RUN` depends on the image built before it;
+      * a `COPY` depends on the contents of the files it copies;
+      * a build argument used by an instruction is part of that
+        instruction's key.
+
+      So this Dockerfile throws the install away every time you touch a
+      source file:
+
+      ```dockerfile
+      COPY . .
+      RUN npm ci
+      ```
+
+      The copy is part of the install's cache key, so the source's contents
+      are too. Swap the order:
+
+      ```dockerfile
+      COPY package.json ./
+      RUN npm ci
+      COPY . .
+      ```
+
+      Now a change to the source leaves the install layer alone, and the
+      expensive step is reused.
+
+      > **Callout**
+      > The cache is a property of the *build*, not of your machine. It is
+      > shared through the daemon and it survives between builds, which is
+      > why the first build of a project is slow and the second is not.
+
+      ## The rule that follows from all of this
+
+      Put the slow, stable steps first and the fast, volatile steps last.
+      Anything that depends on your source belongs after anything that
+      depends on your dependencies.
+    exercises:
+      - id: f-layers-and-instructions
+        title: Count the layers you add
+        prompt: |
+          Write a Dockerfile based on `alpine:3.20` that
+
+          * uses `RUN` to create `/created.txt` containing the word `hello`;
+          * sets `APP_ENV` to `production`;
+          * labels the image `org.opencontainers.image.title=demo`;
+          * exposes port `8080`;
+          * prints the contents of `/created.txt` when the container runs.
+
+          The finished image must have **exactly two layers**: the base
+          image's own, and one for the `RUN`.
+
+          Setting a variable, a label, an exposed port or the command does
+          not add a layer. Creating a file does.
+        kind: image
+        entry_file: Dockerfile
+        files:
+          Dockerfile: |
+            FROM alpine:3.20
+
+            # RUN: create /created.txt containing "hello".
+            # ENV APP_ENV=production
+            # LABEL org.opencontainers.image.title=demo
+            # EXPOSE 8080
+            # CMD: print the contents of /created.txt.
+        solution:
+          Dockerfile: |
+            FROM alpine:3.20
+
+            RUN echo "hello" > /created.txt
+
+            ENV APP_ENV=production
+            LABEL org.opencontainers.image.title=demo
+            EXPOSE 8080
+
+            CMD ["cat", "/created.txt"]
+        checks:
+          - name: the image has two layers
+            kind: inspect
+            template: "{{len .RootFS.Layers}}"
+          - name: the file is in the image
+            kind: run
+            command: cat /created.txt
+          - name: the image sets the variable
+            kind: run
+            command: printenv APP_ENV
+          - name: running the image prints the contents
+            kind: default
+        cases:
+          - name: the default run
+        hints:
+          - "One `RUN` adds one layer, and the base image contributes one of its own."
+          - "`ENV`, `LABEL`, `EXPOSE` and `CMD` change the image's configuration and add nothing."
+          - "Careful with `WORKDIR`: it adds a layer too, so leave it out or count it."
+        teach: |
+          An image is a stack of layers, and each instruction that changes
+          the filesystem adds one. `RUN`, `COPY` and `ADD` do. `ENV`,
+          `LABEL`, `EXPOSE`, `USER` and `CMD` do not -- they change the
+          image's configuration instead, which is stored once, in the image
+          manifest, rather than once per layer.
+
+          `WORKDIR` is the exception that catches people out. It writes
+          nothing, but Docker still records it as an empty layer, so an
+          image with a `WORKDIR` has one more layer than the same image
+          without one.
+
+          The count is worth checking on your own images:
+
+          ```bash
+          docker image inspect --format '{{len .RootFS.Layers}}' myimage:1.0
+          ```
+
+          Two layers is not a goal in itself. It matters because every
+          layer is stored, shipped and cached separately: a layer that never
+          changes is free to reuse, and a layer that changes on every build
+          is paid for on every build.
+        tags: [layers, dockerfile]
+      - id: f-instructions-in-order
+        title: Put the copy before the command that needs it
+        prompt: |
+          The Dockerfile below copies a file and then runs a command that
+          reads it. It does not work, and the build fails.
+
+          Put the instructions in an order that works: a `RUN` can only use
+          files that are already in the image, because the instructions run
+          once, from top to bottom.
+
+          When it is fixed, the container must print `the payload`.
+        kind: image
+        entry_file: Dockerfile
+        files:
+          payload.txt: |
+            the payload
+          Dockerfile: |
+            FROM alpine:3.20
+
+            WORKDIR /app
+
+            RUN cp payload.txt copied.txt
+
+            COPY payload.txt .
+
+            CMD ["cat", "copied.txt"]
+        solution:
+          payload.txt: |
+            the payload
+          Dockerfile: |
+            FROM alpine:3.20
+
+            WORKDIR /app
+
+            COPY payload.txt .
+
+            RUN cp payload.txt copied.txt
+
+            CMD ["cat", "copied.txt"]
+        checks:
+          - name: the copy is in the image
+            kind: run
+            command: cat /app/copied.txt
+          - name: running the image prints the payload
+            kind: default
+        cases:
+          - name: the default run
+        hints:
+          - "The build error names the line that failed; that line is the one running too early."
+          - "`COPY payload.txt .` puts the file in the working directory, which is `/app`."
+          - "Swap the two instructions and the build succeeds."
+        teach: |
+          Docker builds an image by running the instructions in order,
+          against the image produced by the instructions before them. There
+          is no dependency graph, no second pass and no reordering: if a
+          `RUN` needs a file, the `COPY` that provides it has to be
+          earlier in the file.
+
+          This is the same fact that makes the build cache work, seen from
+          the other side. The cache key of a `RUN` is the instruction plus
+          the image it is applied to, so what came before is part of what
+          the `RUN` depends on.
+
+          The failure mode is loud -- the build stops and the shell says
+          `cp: can't stat 'payload.txt'` -- which makes it one of the
+          friendlier mistakes in Docker. The quiet version is the one where
+          the order is right but the *cache* is wrong: the build succeeds
+          every time and is slow every time.
+        tags: [layers, dockerfile]
+      - id: f-keep-the-cache
+        title: Install before you copy the source
+        prompt: |
+          A Dockerfile that copies the source tree and only then installs
+          the dependencies throws the install away every time the source
+          changes: the copied files are part of the install's cache key, so
+          every edit invalidates it.
+
+          Put the dependency step first. Have it record how many files were
+          in `/app` at the moment it ran, in the file `/count.txt` -- at the
+          root of the filesystem, not inside `/app`.
+
+          When the dependencies are installed before the source is copied,
+          `/app` is still empty and `/count.txt` contains `0`. The source
+          file must still end up in the image afterwards.
+        kind: image
+        entry_file: Dockerfile
+        files:
+          app.txt: |
+            the application source
+          Dockerfile: |
+            FROM alpine:3.20
+
+            WORKDIR /app
+
+            # The dependency step goes here, and records the number of
+            # files in /app into /count.txt.
+
+            COPY app.txt /app/app.txt
+
+            CMD ["ls", "/app"]
+        solution:
+          app.txt: |
+            the application source
+          Dockerfile: |
+            FROM alpine:3.20
+
+            WORKDIR /app
+
+            RUN ls -1 /app | wc -l > /count.txt
+
+            COPY app.txt /app/app.txt
+
+            CMD ["ls", "/app"]
+        checks:
+          - name: the dependency step ran before the source was copied
+            kind: run
+            command: cat /count.txt
+          - name: the source is in the image
+            kind: run
+            command: test -f /app/app.txt
+          - name: running the image lists the source
+            kind: default
+        cases:
+          - name: the default run
+        hints:
+          - "The dependency step is a `RUN` that counts the files in `/app` and writes the number to `/count.txt`."
+          - "`ls -1 /app | wc -l` prints how many entries there are -- zero when the directory is empty."
+          - "Write the count to `/count.txt`, at the root; a file inside `/app` would be counted by the very command that writes it."
+        teach: |
+          The build cache is per instruction, and an instruction's key
+          includes everything it is applied to. A `RUN` is applied to the
+          image built before it, so a `COPY` that runs first is part of the
+          install's key -- and with it, the contents of every file copied.
+
+          That is why the order in a Dockerfile is a performance decision
+          and not just a style preference:
+
+          ```dockerfile
+          COPY package.json ./     # the manifest changes rarely
+          RUN npm ci               # the install is slow, and now it is cached
+          COPY . .                 # the source changes all the time
+          ```
+
+          With the copy of the source first, every edit to a source file
+          produces a new image state, a new install key, and a full
+          reinstall. With it last, the install layer is reused and only the
+          cheap copy is redone.
+
+          The exercise measures this rather than asking you to take it on
+          faith. The dependency step records what `/app` contained when it
+          ran; if the source had already been copied, the count would be
+          `1` instead of `0`, and the ordering would be wrong however good
+          the intentions were.
+        tags: [layers, optimisation]
+      - id: f-delete-in-the-same-layer
+        title: Delete build tools in the same layer
+        prompt: |
+          A layer can only add files. Deleting a file in a later `RUN`
+          hides it from the final image, but the bytes are still in the layer
+          underneath and the image stays big.
+
+          The Dockerfile below writes a megabyte of junk and then deletes it
+          in a second `RUN`. Put both steps in the same `RUN`, so the junk
+          never enters an image layer at all.
+
+          The image must still be small afterwards -- the check compares its
+          size against a reference.
+        kind: image
+        entry_file: Dockerfile
+        files:
+          Dockerfile: |
+            FROM alpine:3.20
+
+            RUN mkdir -p /opt/build && head -c 1048576 /dev/zero > /opt/build/junk.bin
+
+            RUN rm -rf /opt/build
+
+            CMD ["sh", "-c", "test ! -e /opt/build && echo cleaned"]
+        solution:
+          Dockerfile: |
+            FROM alpine:3.20
+
+            RUN mkdir -p /opt/build && head -c 1048576 /dev/zero > /opt/build/junk.bin && rm -rf /opt/build
+
+            CMD ["sh", "-c", "test ! -e /opt/build && echo cleaned"]
+        checks:
+          - name: the image is small
+            kind: inspect
+            template: "{{.Size}}"
+            settings:
+              relative_tolerance: 0.02
+          - name: the junk is not in the image
+            kind: run
+            command: test ! -e /opt/build
+          - name: running the image reports it cleaned
+            kind: default
+        cases:
+          - name: the default run
+        hints:
+          - "The two commands have to run in the same `RUN`, which means the same shell invocation."
+          - "A backslash at the end of the line continues the instruction onto the next one, and `&&` chains the commands."
+          - "Deleting the file in the same `RUN` means the layer never records it, so the bytes are never stored."
+        teach: |
+          A layer is a diff, and a diff can only describe what was added.
+          When a file is created in one layer and deleted in another, the
+          first layer still contains it -- the image still carries the bytes,
+          and `docker images` still shows the size it had.
+
+          Deleting the file in the *same* `RUN` means the layer's final
+          state never contained it, so it is never written to disk and never
+          shipped. The image ends up smaller by the size of the junk, and
+          the layer that would have held it is not there at all.
+
+          This is why the advice is to install packages and remove the
+          package cache in one step:
+
+          ```dockerfile
+          RUN apk add --no-cache curl && rm -rf /var/cache/apk/*
+          ```
+
+          The same reasoning explains why `apt-get update` in its own `RUN`
+          is a bad idea: the update is a layer of its own, and the install
+          in the next layer depends on it, so the two have to travel
+          together -- and the package lists are stale the moment the image
+          is built.
+
+          The check here reads `{{.Size}}` out of the image's configuration.
+          It is the one number that tells you whether any of this
+          discipline is actually paying off.
+        tags: [layers, optimisation]
+  - id: f-commands-and-arguments
+    title: Commands and arguments
+    summary: CMD, ENTRYPOINT, the two forms they come in, and how arguments arrive.
+    body: |
+      # Commands and arguments
+
+      Two instructions decide what a container does. `ENTRYPOINT` is the
+      program; `CMD` is the arguments it gets by default.
+
+      ```dockerfile
+      ENTRYPOINT ["/app/server"]
+      CMD ["--port", "8080"]
+      ```
+
+      `docker run myimage` runs `/app/server --port 8080`. `docker run
+      myimage --verbose` runs `/app/server --verbose`: the arguments after
+      the image name **replace** `CMD`, they do not extend it.
+
+      ## Exec form or shell form
+
+      ```dockerfile
+      CMD ["echo", "hello"]     # exec form
+      CMD echo "hello"          # shell form
+      ```
+
+      The exec form runs the program directly. The shell form runs
+      `/bin/sh -c "echo \"hello\""`, so the shell sees the line and
+      interprets it: `&&`, `|`, `$VAR` and the quoting rules all apply.
+
+      That is why this starts the app *and then* prints `done`:
+
+      ```dockerfile
+      CMD npm start && echo done
+      ```
+
+      The exec form would pass `&&` to `npm` as an argument.
+
+      The exec form is the better default. It is what Docker's own
+      documentation uses, it hands the program exactly the arguments you
+      wrote, and it makes the program's own process the container's main
+      process -- which is what lets the program receive `SIGTERM` when the
+      container is stopped. Under the shell form the signal goes to the
+      shell, and a shell does not reliably pass it on to the program it
+      started, so the program is killed rather than asked to shut down.
+
+      > **Callout**
+      > The exec form does not run a shell, so it does not expand
+      > variables either. `CMD ["echo", "$APP_ENV"]` prints the eight
+      > characters `$APP_ENV`. When you want the shell to expand
+      > something, say so: `CMD ["sh", "-c", "echo $APP_ENV"]`.
+
+      ## ENTRYPOINT, CMD, and the two together
+
+      | Image has | `docker run img` | `docker run img extra` |
+      | --- | --- | --- |
+      | `CMD` only | runs `CMD` | runs `extra` instead |
+      | `ENTRYPOINT` only | runs `ENTRYPOINT` | runs `ENTRYPOINT extra` |
+      | both | runs `ENTRYPOINT` + `CMD` | runs `ENTRYPOINT` + `extra` |
+
+      With an `ENTRYPOINT`, the arguments after the image name are *added* to
+      the program. Without one, they *replace* it completely -- which is
+      why `docker run alpine:3.20 echo hi` works and
+      `docker run alpine:3.20 hi` does not.
+
+      ## The last one wins
+
+      A Dockerfile may set `CMD` more than once. Docker keeps the last
+      instruction of each kind and discards the earlier ones; it never
+      merges them. The same is true of `ENV`, `ENTRYPOINT`, `EXPOSE` and
+      `USER`.
+
+      ```dockerfile
+      ENV APP_ENV=development
+      ENV APP_ENV=production      # this is the one that counts
+      ```
+    exercises:
+      - id: f-exec-form
+        title: Stop the shell from reading your command
+        prompt: |
+          The image below prints two lines. The shell form of `CMD` hands
+          the line to `/bin/sh -c`, and the shell acts on the `&&`.
+
+          The image must print exactly one line, and that line must be:
+
+          ```
+          hello && echo world
+          ```
+
+          The `&&` has to reach the program as part of the text, not be
+          acted on by a shell.
+        kind: image
+        entry_file: Dockerfile
+        files:
+          Dockerfile: |
+            FROM alpine:3.20
+
+            CMD echo hello && echo world
+        solution:
+          Dockerfile: |
+            FROM alpine:3.20
+
+            CMD ["echo", "hello && echo world"]
+        checks:
+          - name: running the image prints one line
+            kind: default
+        cases:
+          - name: the default run
+        hints:
+          - "The exec form of `CMD` is a JSON array, and the strings in it go straight to the program."
+          - "`CMD [\"echo\", \"hello && echo world\"]` runs `echo` with one argument, and no shell ever sees it."
+          - "The check compares the output exactly, so two lines will not do."
+        teach: |
+          The two forms are not stylistic variants. They are two different
+          ways of starting a process.
+
+          The exec form -- `CMD ["echo", "hello && echo world"]` -- is a
+          direct `execve` of `echo` with one argument. The program gets the
+          argument exactly as written, and the container's main process is
+          the program itself.
+
+          The shell form -- `CMD echo hello && echo world` -- is
+          `/bin/sh -c "echo hello && echo world"`. The shell parses the
+          line, so `&&` separates two commands and both run. The same thing
+          happens with a pipe, a redirect, or a glob: the shell expands it
+          before the program sees anything.
+
+          The consequence that bites in production is signal handling.
+          `docker stop` sends `SIGTERM` to the container's main process
+          and waits for it to exit. Under the exec form that process is
+          your program. Under the shell form it is the shell, and a shell
+          does not reliably pass the signal on to the program it started
+          -- so the program never gets to close its connections and is
+          killed when the grace period runs out.
+
+          The check here is exact, because the difference between the two
+          forms is exactly one line of output.
+        tags: [dockerfile, commands]
+      - id: f-entrypoint-args
+        title: Give the program its arguments
+        prompt: |
+          The build context holds a script called `entrypoint.sh`:
+
+          ```sh
+          #!/bin/sh
+          echo "args: $*"
+          ```
+
+          Write a Dockerfile based on `alpine:3.20` that runs that script as
+          the container's program, with the single argument `default`.
+
+          When the container runs, it must print `args: default`.
+
+          `ENTRYPOINT` is the program. `CMD` is the arguments it is given.
+        kind: image
+        entry_file: Dockerfile
+        files:
+          entrypoint.sh: |
+            #!/bin/sh
+            echo "args: $*"
+          Dockerfile: |
+            FROM alpine:3.20
+
+            # Copy entrypoint.sh into the image, run it as the entrypoint,
+            # and give it the argument "default".
+        solution:
+          entrypoint.sh: |
+            #!/bin/sh
+            echo "args: $*"
+          Dockerfile: |
+            FROM alpine:3.20
+
+            COPY entrypoint.sh /app/entrypoint.sh
+            RUN chmod +x /app/entrypoint.sh
+
+            ENTRYPOINT ["/app/entrypoint.sh"]
+            CMD ["default"]
+        checks:
+          - name: the script is in the image
+            kind: run
+            command: test -f /app/entrypoint.sh
+          - name: running the image prints the arguments
+            kind: default
+        cases:
+          - name: the default run
+        hints:
+          - "`ENTRYPOINT` takes the program and `CMD` takes its default arguments; Docker runs them together."
+          - "The exec form runs the file directly, so the file has to be executable -- a `RUN` with `chmod +x` does that."
+          - "The script prints the arguments it was given, so the container's output tells you whether `default` arrived."
+        teach: |
+          `ENTRYPOINT` and `CMD` are not two ways of saying the same thing.
+          `ENTRYPOINT` fixes the program; `CMD` supplies the arguments that
+          program gets when nothing overrides them. Docker concatenates
+          them, so
+
+          ```dockerfile
+          ENTRYPOINT ["/app/entrypoint.sh"]
+          CMD ["default"]
+          ```
+
+          runs `/app/entrypoint.sh default`.
+
+          The arrangement is what makes an image useful as a command-line
+          tool. With an `ENTRYPOINT` of `/app/entrypoint.sh`, `docker run
+          myimage --verbose` runs `/app/entrypoint.sh --verbose`: the
+          arguments the user types are handed to your program, and the
+          program's identity is not something the user can accidentally
+          replace.
+
+          The `chmod +x` is not decoration. The exec form does not go
+          through a shell, so the runtime `execve`s the file directly, and
+          a file that is not executable fails with `permission denied`. A
+          file that came out of your working copy may or may not carry the
+          bit -- `git` tracks it, a build artefact might not -- so set it
+          in the image rather than trusting it.
+
+          Running the script through `sh` instead works too, and is what
+          you would do for a script with no shebang.
+        tags: [commands, dockerfile]
+      - id: f-last-cmd-wins
+        title: Only the last instruction counts
+        prompt: |
+          Your Dockerfile sets `ENV APP_ENV` and `CMD` twice each, and the
+          image ends up with the wrong values.
+
+          Docker keeps the last instruction of each kind and discards the
+          earlier ones. It does not merge them, and it does not warn you.
+
+          Make the image print `final`, and make `APP_ENV` be `final` as
+          well.
+        kind: image
+        entry_file: Dockerfile
+        files:
+          Dockerfile: |
+            FROM alpine:3.20
+
+            ENV APP_ENV=first
+            ENV APP_ENV=second
+
+            CMD ["echo", "first"]
+            CMD ["echo", "second"]
+        solution:
+          Dockerfile: |
+            FROM alpine:3.20
+
+            ENV APP_ENV=first
+            ENV APP_ENV=final
+
+            CMD ["echo", "first"]
+            CMD ["echo", "final"]
+        checks:
+          - name: the image sets the variable
+            kind: run
+            command: printenv APP_ENV
+          - name: running the image prints final
+            kind: default
+        cases:
+          - name: the default run
+        hints:
+          - "The second `ENV` wins, and the second `CMD` wins; the first of each is thrown away."
+          - "Put the values you want in the last instruction of each kind."
+          - "`printenv APP_ENV` reads the value out of the running container's environment."
+        teach: |
+          Setting the same thing twice in a Dockerfile is not an error, and
+          it is not a merge. Docker takes the last instruction of each kind
+          and drops the rest, so the image ends up with the second `ENV`
+          and the second `CMD`.
+
+          This is worth knowing because the failure is silent. There is no
+          warning, no error, and the build log shows both instructions
+          executing happily. The only symptom is that the image does not
+          do what the file appears to say.
+
+          The same rule covers `ENTRYPOINT`, `EXPOSE`, `USER` and `WORKDIR`.
+          It bites hardest with `ENV`, because a duplicated `ENV` is a
+          natural way to try to give a variable a default and then override
+          it -- and it does not work. If you want a default that a build
+          argument can replace, use `ARG`:
+
+          ```dockerfile
+          ARG APP_ENV=production
+          ENV APP_ENV=${APP_ENV}
+          ```
+
+          One `ENV`, and the value comes from the build.
+        tags: [config, commands]
+      - id: f-run-arguments
+        title: What happens to the arguments you pass
+        prompt: |
+          Two images are already built in this directory:
+
+          * `trainer-args-cmd:1.0` has a `CMD` and no `ENTRYPOINT`;
+          * `trainer-args-entry:1.0` has both an `ENTRYPOINT` and a `CMD`.
+
+          Write `solve.sh` so that it runs each of them twice -- once with
+          no arguments, and once with the arguments `echo custom` -- and
+          prints the four outputs, in that order.
+
+          The first run of each image uses the image's own command. The
+          second run passes `echo custom` after the image name.
+        kind: cli
+        entry_file: solve.sh
+        setup:
+          - "printf '%s\\n' 'FROM alpine:3.20' 'CMD [\"echo\",\"default\"]' > Dockerfile.cmd; printf '%s\\n' 'FROM alpine:3.20' 'ENTRYPOINT [\"echo\",\"fixed\"]' 'CMD [\"default\"]' > Dockerfile.entry; docker build -q -f Dockerfile.cmd -t trainer-args-cmd:1.0 . > /dev/null; docker build -q -f Dockerfile.entry -t trainer-args-entry:1.0 . > /dev/null"
+        teardown:
+          - "docker image rm -f trainer-args-cmd:1.0 trainer-args-entry:1.0"
+        files:
+          solve.sh: |
+            # Run trainer-args-cmd:1.0 and trainer-args-entry:1.0, each with
+            # no arguments and then with the arguments "echo custom", and
+            # print the four outputs in that order.
+        solution:
+          solve.sh: |
+            docker run --rm trainer-args-cmd:1.0
+            docker run --rm trainer-args-cmd:1.0 echo custom
+            docker run --rm trainer-args-entry:1.0
+            docker run --rm trainer-args-entry:1.0 echo custom
+        checks:
+          - name: the script's output
+            kind: script
+            command: sh solve.sh
+        cases:
+          - name: the default run
+        hints:
+          - "`docker run --rm <image>` runs the image with its own command; `docker run --rm <image> echo custom` passes two extra arguments."
+          - "Print the four outputs in the order the prompt lists them, one per line."
+          - "Nothing needs building -- both images are already there."
+        teach: |
+          The arguments after the image name are the whole of the
+          difference between the two images here, and they land in
+          different places.
+
+          With only a `CMD`, the arguments **replace** the command
+          entirely. `docker run img` runs the image's `CMD`; `docker run img
+          echo custom` runs `echo custom` instead, and the image's own
+          `CMD` is discarded. That is why `docker run alpine:3.20 echo hi`
+          works but `docker run alpine:3.20 hi` does not -- `hi` is not a
+          program.
+
+          With an `ENTRYPOINT`, the arguments are **appended** to the
+          program. `docker run img` runs `ENTRYPOINT` with `CMD`'s
+          arguments; `docker run img echo custom` runs `ENTRYPOINT` with
+          `echo custom` in place of `CMD`.
+
+          This is why an image with an `ENTRYPOINT` behaves like a command
+          and an image with only a `CMD` behaves like a template. The
+          first is something you type arguments to; the second is
+          something you replace.
+
+          The practical consequence for a Dockerfile: put the program in
+          `ENTRYPOINT` if you want users to pass it arguments, and in
+          `CMD` if the image is meant to be run as-is.
+        tags: [commands, cli]
+  - id: f-environment-and-config
+    title: Environment and configuration
+    summary: ARG, ENV, build arguments, and overriding a value at run time.
+    body: |
+      # Environment and configuration
+
+      Docker has two ways to hand a value to an image, and they behave
+      differently enough that confusing them is a reliable source of "why is
+      my variable empty".
+
+      | | `ENV` | `ARG` |
+      | --- | --- | --- |
+      | Exists during the build | yes | yes |
+      | Exists at run time | yes | no |
+      | Part of the image's configuration | yes | no |
+      | Overridable with `--build-arg` | no | yes |
+      | Overridable with `docker run -e` | yes | no |
+
+      ## ARG is for the build
+
+      ```dockerfile
+      ARG VERSION=1.0.0
+      RUN echo "building ${VERSION}" > /version.txt
+      ```
+
+      An `ARG` is substituted into the instructions that use it while the
+      image is being built. The value is not in the running container, and
+      it is not in the image's configuration either -- two images built from
+      the same Dockerfile with different arguments differ in their layers,
+      not in their environment.
+
+      ```bash
+      docker build --build-arg VERSION=2.0.0 -t myimage:2.0.0 .
+      ```
+
+      ## ENV is for the image
+
+      ```dockerfile
+      ENV APP_ENV=production
+      ```
+
+      `ENV` writes the variable into the image's configuration. Every `RUN`
+      after it sees the variable, every container started from the image has
+      it, and `docker image inspect` lists it under `Config.Env`.
+
+      It can still be overridden, per container:
+
+      ```bash
+      docker run --rm -e APP_ENV=staging myimage:1.0
+      ```
+
+      That override changes the container, not the image. One artefact can
+      be deployed as staging and as production, which is the point: the
+      image describes what the software *is*, and the environment describes
+      where it is running.
+
+      ## Turning one into the other
+
+      ```dockerfile
+      ARG VERSION=1.0.0
+      ENV APP_VERSION=${VERSION}
+      ```
+
+      This is the common pattern. Take a value at build time -- from the
+      command line, from a tag, from a CI variable -- and bake it into the
+      image's configuration, where it is visible to the running container
+      and can still be overridden per deployment.
+
+      > **Callout**
+      > An `ARG` is in scope only from the line that declares it to the end
+      > of the build stage, and it must be declared before the instruction
+      > that uses it. A `FROM` is the exception: an `ARG` declared *before*
+      > `FROM` can be used in the `FROM` line, and is not in scope after
+      > it.
+
+      ## Which one is it
+
+      Ask what the value describes. If it describes the artefact -- its
+      version, the commit it was built from, the feature set it was
+      compiled with -- it belongs in the image, and `ENV` (usually fed by
+      an `ARG`) is the answer. If it describes the deployment -- the
+      database to connect to, the log level, the feature flag -- it belongs
+      in the environment, and the image should merely declare a sensible
+      default.
+    exercises:
+      - id: f-env-at-runtime
+        title: Set a variable that is still there at run time
+        prompt: |
+          Write a Dockerfile based on `alpine:3.20` that sets the
+          environment variable `APP_ENV` to `production`, and prints
+          `production` when the container runs.
+
+          The variable has to be part of the image, not something the
+          container is told at run time. A build argument will not do: a
+          build argument does not exist once the image is running.
+        kind: image
+        entry_file: Dockerfile
+        files:
+          Dockerfile: |
+            FROM alpine:3.20
+
+            # Set APP_ENV=production, and print it when the container runs.
+            #
+            # ARG would not do: it only exists while the image is built.
+        solution:
+          Dockerfile: |
+            FROM alpine:3.20
+
+            ENV APP_ENV=production
+
+            CMD ["sh", "-c", "echo $APP_ENV"]
+        checks:
+          - name: the container has the variable
+            kind: run
+            command: printenv APP_ENV
+          - name: running the image prints the value
+            kind: default
+        cases:
+          - name: the default run
+        hints:
+          - "`ENV` writes the variable into the image's configuration; `ARG` only exists while the image is being built."
+          - "The exec form of `CMD` does not expand variables -- hand the command to `sh -c` if you want the shell to."
+          - "`printenv APP_ENV` reads the variable out of the running container."
+        teach: |
+          `ENV` and `ARG` are both ways of naming a value, and the
+          difference is when the value exists.
+
+          An `ARG` is a build-time input. Docker substitutes it into the
+          instructions that use it while the image is built, and then it is
+          gone: the running container has no such variable, and the image's
+          configuration does not list it. This is deliberate -- build
+          arguments are often secrets, and keeping them out of the image
+          keeps them out of `docker image inspect` and out of anything
+          that pulls the image.
+
+          An `ENV` is a property of the image. It is set for every `RUN`
+          that follows it, it is present in every container started from
+          the image, and it shows up in the image's configuration:
+
+          ```bash
+          docker image inspect --format '{{json .Config.Env}}' myimage:1.0
+          ```
+
+          The `printenv` check is the runtime half of the same fact. If the
+          variable is only an `ARG`, `printenv` finds nothing and exits
+          with a status of 1 -- which is the difference between the two
+          instructions, stated as a failing command rather than a
+          definition.
+        tags: [config, dockerfile]
+      - id: f-build-arg-override
+        title: Take the value at build time
+        prompt: |
+          Write a Dockerfile based on `alpine:3.20` that takes a build
+          argument `LOG_LEVEL`, defaulting to `info`, and writes that value
+          into the file `/etc/log-level` while the image is built.
+
+          When the container runs, it must print the contents of that file.
+
+          The grader builds the image twice: once with no arguments, so
+          that the default applies, and once with `LOG_LEVEL=debug`. Each
+          image must report the value it was built with.
+        kind: image
+        entry_file: Dockerfile
+        files:
+          Dockerfile: |
+            FROM alpine:3.20
+
+            # Declare LOG_LEVEL with the default "info", and write it into
+            # /etc/log-level during the build.
+        solution:
+          Dockerfile: |
+            FROM alpine:3.20
+
+            ARG LOG_LEVEL=info
+
+            RUN echo "$LOG_LEVEL" > /etc/log-level
+
+            CMD ["cat", "/etc/log-level"]
+        checks:
+          - name: the image reports the level it was built with
+            kind: default
+        cases:
+          - name: the default build
+          - name: an explicit level
+            build_args:
+              LOG_LEVEL: "debug"
+        hints:
+          - "`ARG LOG_LEVEL=info` declares the argument and its default value."
+          - "A `RUN` can use an `ARG` directly -- the value is substituted into the command while the build runs."
+          - "The file is written at build time, so the value it holds is fixed for the life of the image."
+        teach: |
+          A build argument is a parameter of the *build*, and it has a
+          default so that the build still works when nobody passes one.
+          `ARG LOG_LEVEL=info` means "unless the build says otherwise, this
+          is `info`".
+
+          The value is substituted into the instructions that use it while
+          the build runs. `RUN echo "$LOG_LEVEL" > /etc/log-level` becomes
+          `echo "info" > /etc/log-level` -- or `echo "debug" ...` when the
+          build passes `--build-arg LOG_LEVEL=debug`.
+
+          What makes this worth doing is where the value ends up. Writing
+          it into a file at build time fixes it in the image: the image
+          cannot be started in a way that contradicts what it says about
+          itself. Reading it from the environment at run time leaves it
+          open, and an operator with a stray `LOG_LEVEL` in their shell
+          changes what the container does.
+
+          The two cases here are the whole contract. The same Dockerfile
+          produces two images, and each one reports the level it was built
+          with.
+        tags: [config, images]
+      - id: f-runtime-override
+        title: Override a variable for one container
+        prompt: |
+          Write a Dockerfile based on `alpine:3.20` that sets the
+          environment variable `APP_MODE` to `development`, and prints the
+          value of `APP_MODE` when the container runs.
+
+          The grader starts the container with `APP_MODE=production` in its
+          environment. The container must print `production`, and the image
+          itself must still say `development`.
+
+          The override changes the container, not the image. The value also
+          has to be read when the container runs -- a value baked into a
+          file at build time would ignore the override entirely.
+        kind: image
+        entry_file: Dockerfile
+        files:
+          Dockerfile: |
+            FROM alpine:3.20
+
+            # Set APP_MODE=development, and print it when the container runs.
+        solution:
+          Dockerfile: |
+            FROM alpine:3.20
+
+            ENV APP_MODE=development
+
+            CMD ["sh", "-c", "echo $APP_MODE"]
+        checks:
+          - name: the container reports its mode
+            kind: default
+          - name: the image still carries the default
+            kind: inspect
+            template: "{{json .Config.Env}}"
+        cases:
+          - name: with an override
+            env:
+              APP_MODE: "production"
+        hints:
+          - "`ENV APP_MODE=development` bakes the default into the image."
+          - "The grader passes the override with `--env`, which beats the image's own value."
+          - "Read the value at run time -- a `RUN` that writes it into a file would fix it at build time instead."
+        teach: |
+          An `ENV` is a default, not a constant. The value baked into the
+          image is what the container gets when nobody says otherwise, and
+          `docker run -e APP_MODE=production` beats it.
+
+          The override is applied when the container is created, so it never
+          touches the image. The image still says `development`; this
+          particular container says `production`. That separation is what
+          lets one artefact be promoted through environments without being
+          rebuilt -- the same image runs as staging and as production, and
+          the difference is in how it is started.
+
+          The second check reads the image's configuration rather than the
+          container's environment, and it still says `development`. The
+          override is not in the image and never was.
+
+          The practical rule: bake in what is true of the artefact, and
+          leave what is true of the deployment to the deployment. Reading
+          the value at run time -- rather than baking it into a file at
+          build time -- is what makes the override work at all.
+        tags: [config, images]
+      - id: f-optional-dev-deps
+        title: Make the build tools optional
+        prompt: |
+          Write a Dockerfile based on `alpine:3.20` that takes a build
+          argument `WITH_DEV_TOOLS`, and installs a marker file at
+          `/usr/local/bin/devtool` only when that argument is `true`.
+
+          The container must print `devtool-present` when the tool is there
+          and `devtool-absent` when it is not.
+
+          The grader builds the image twice: once with
+          `WITH_DEV_TOOLS=true` and once with `WITH_DEV_TOOLS=false`.
+        kind: image
+        entry_file: Dockerfile
+        files:
+          Dockerfile: |
+            FROM alpine:3.20
+
+            # Declare WITH_DEV_TOOLS, and install /usr/local/bin/devtool
+            # only when it is true.
+            #
+            # The container must print "devtool-present" or
+            # "devtool-absent".
+        solution:
+          Dockerfile: |
+            FROM alpine:3.20
+
+            ARG WITH_DEV_TOOLS=true
+
+            RUN if [ "$WITH_DEV_TOOLS" = "true" ]; then echo devtool > /usr/local/bin/devtool; fi
+
+            CMD ["sh", "-c", "if [ -f /usr/local/bin/devtool ]; then echo devtool-present; else echo devtool-absent; fi"]
+        checks:
+          - name: the image reports the tool
+            kind: default
+          - name: the tool is in the image
+            kind: run
+            command: test -f /usr/local/bin/devtool
+        cases:
+          - name: with the tools
+            build_args:
+              WITH_DEV_TOOLS: "true"
+          - name: without the tools
+            build_args:
+              WITH_DEV_TOOLS: "false"
+        hints:
+          - "`ARG WITH_DEV_TOOLS=true` declares the argument and its default."
+          - "A `RUN` can branch on the argument -- an `if` statement in the shell is enough."
+          - "The argument is substituted into the command at build time, so the branch is decided while the image is being built."
+        teach: |
+          A build argument is a parameter of the build, so it can decide
+          what the build does. The value is substituted into the `RUN`
+          command before the shell sees it, and the shell's `if` makes the
+          decision at build time -- which is the only time it can be made,
+          because the branch changes what is *in* the image.
+
+          This is the standard way to keep development tooling out of a
+          production image:
+
+          ```dockerfile
+          ARG INSTALL_DEV_TOOLS=false
+          RUN if [ "$INSTALL_DEV_TOOLS" = "true" ]; then \
+                apk add --no-cache curl jq; \
+              fi
+          ```
+
+          The build is the right place for the decision. Deciding at run
+          time instead -- installing the tools when the container starts --
+          means every container pays for them, and it means the image
+          carries them whether they are used or not.
+
+          One thing to be careful about: the `ARG` has to be declared
+          *before* the `RUN` that uses it, and an `ARG` that is not
+          turned into an `ENV` stays inside the build. The two cases here
+          differ only in the argument, and the two images differ only in
+          what they carry.
+        tags: [config, optimisation]
+  - id: f-files-and-context
+    title: Files and the build context
+    summary: What COPY can reach, what ADD does extra, and what never leaves your machine.
+    body: |
+      # Files and the build context
+
+      `COPY` takes files from the build context, and the build context is
+      the directory you ran `docker build` in. That is the only place
+      `COPY` can reach.
+
+      ```bash
+      docker build -t myimage:1.0 .
+      ```
+
+      The `.` is the context. Docker sends the whole directory to the
+      daemon, and then builds the image from it.
+
+      > **Callout**
+      > The context is uploaded *before* the build starts, and it is
+      > uploaded in full. A 2 GB `node_modules` in your project is 2 GB
+      > across the network on every cold build, whether or not your
+      > Dockerfile mentions it.
+
+      ## Paths are relative to the context root
+
+      The source path in a `COPY` is resolved against the context, not
+      against the Dockerfile. With this layout:
+
+      ```
+      project/
+        Dockerfile
+        notes.txt
+        src/
+          main.txt
+      ```
+
+      * `COPY notes.txt /app/` works.
+      * `COPY project/notes.txt /app/` does not -- there is no `project`
+        directory in the context, because the context *is* `project`.
+      * `COPY src /app/src` puts `main.txt` at `/app/src/main.txt`: `COPY`
+        copies the *contents* of a directory, and the destination path is
+        what decides whether the directory survives.
+
+      This bites hardest when the Dockerfile is not in the context root.
+      `docker build -f app/Dockerfile .` still has the project root as its
+      context, so `COPY notes.txt` in `app/Dockerfile` refers to
+      `project/notes.txt`.
+
+      ## ADD is COPY with two extra powers
+
+      `ADD` can fetch a URL and it can unpack a local tar archive. Both are
+      convenient, and both make a build depend on something outside the
+      build context:
+
+      * a URL is fetched again on every build that is not cached, so the
+        image is not reproducible;
+      * an archive can contain anything at all, including a `Dockerfile`
+        that overwrites the one you are building.
+
+      Use `COPY` unless you genuinely need one of the other two. It is
+      the instruction that says what it does.
+
+      ## .dockerignore
+
+      A `.dockerignore` file in the context root lists what must *not* be
+      sent to the daemon. One pattern per line, matched against paths
+      relative to the context root:
+
+      ```
+      .git
+      node_modules
+      *.log
+      secrets/
+      ```
+
+      The effect is twofold. The build is faster, because a smaller
+      context is uploaded. And files that should never leave your machine
+      do not leave your machine.
+
+      A file excluded by `.dockerignore` is not in the context at all, so
+      `COPY` cannot reach it -- not even by name. The build fails with
+      "not found" rather than quietly copying something you meant to
+      exclude.
+    exercises:
+      - id: f-copy-a-directory
+        title: Copy a directory without flattening it
+        prompt: |
+          The build context holds a directory called `src`, with a file
+          `main.txt` inside it.
+
+          Copy it into the image so that the file ends up at
+          `/app/src/main.txt`. The directory itself has to be there, not
+          just its contents.
+
+          `COPY` copies the *contents* of a directory, so the destination
+          path is what decides whether the directory survives.
+        kind: image
+        entry_file: Dockerfile
+        files:
+          src/main.txt: |
+            the main file
+          Dockerfile: |
+            FROM alpine:3.20
+
+            # Copy the src directory into the image so that main.txt ends
+            # up at /app/src/main.txt.
+        solution:
+          src/main.txt: |
+            the main file
+          Dockerfile: |
+            FROM alpine:3.20
+
+            COPY src /app/src
+
+            CMD ["ls", "/app/src"]
+        checks:
+          - name: the directory is in the image
+            kind: run
+            command: test -f /app/src/main.txt
+          - name: the contents were not flattened
+            kind: run
+            command: test ! -e /app/main.txt
+          - name: running the image lists the directory
+            kind: default
+        cases:
+          - name: the default run
+        hints:
+          - "The source is the directory `src`; the destination decides whether `src` survives in the image."
+          - "`COPY src /app/src` puts the contents of `src` inside `/app/src`."
+          - "`COPY src /app` would flatten it, and `main.txt` would end up at `/app/main.txt`."
+        teach: |
+          `COPY` copies the *contents* of a source directory into the
+          destination directory. The directory itself is not an object that
+          gets copied -- it only survives if the destination path names it.
+
+          That is why `COPY src /app/src` and `COPY src /app` behave
+          differently:
+
+          ```
+          COPY src /app/src     ->  /app/src/main.txt
+          COPY src /app         ->  /app/main.txt
+          ```
+
+          Both copy `main.txt`. Only the first keeps the directory, because
+          the destination says where the contents should land.
+
+          The rule for the destination is worth stating plainly: if the
+          destination path does not end in a directory that already
+          exists, Docker creates it and puts the contents in it. If it
+          does exist, the contents go inside it. Either way the source
+          directory's *name* is not carried over -- you have to put it in
+          the destination yourself.
+
+          This is also why `COPY . .` inside `/app` copies the context's
+          files into `/app` and not into `/app/.`.
+        tags: [files, dockerfile]
+      - id: f-copy-not-add
+        title: Use COPY, not ADD
+        prompt: |
+          The build context holds a file called `notes.txt`. Copy it into
+          the image at `/app/notes.txt`, unchanged, and print it when the
+          container runs.
+
+          Use `COPY`. Do not use `ADD` -- your Dockerfile must not contain
+          the word `ADD` at all.
+
+          `ADD` can fetch a URL and can unpack a tar archive. Both make
+          the build depend on something outside the build context, which
+          is exactly the kind of dependency a Dockerfile should not have.
+        kind: image
+        entry_file: Dockerfile
+        files:
+          notes.txt: |
+            release notes
+          Dockerfile: |
+            FROM alpine:3.20
+
+            # Copy notes.txt to /app/notes.txt, and print it when the
+            # container runs.
+        solution:
+          notes.txt: |
+            release notes
+          Dockerfile: |
+            FROM alpine:3.20
+
+            COPY notes.txt /app/notes.txt
+
+            CMD ["cat", "/app/notes.txt"]
+        checks:
+          - name: the file is in the image
+            kind: run
+            command: cat /app/notes.txt
+          - name: running the image prints the contents
+            kind: default
+        settings:
+          forbid: ["ADD "]
+          require: ["COPY "]
+        cases:
+          - name: the default run
+        hints:
+          - "`COPY` takes a source from the build context and a destination inside the image."
+          - "The destination `/app/notes.txt` is a path in the image; the source `notes.txt` is a path in the context."
+          - "Leave `notes.txt` as it is; the check compares what ends up in the image with the file you were given."
+        teach: |
+          `ADD` is `COPY` plus two abilities, and both of them are
+          liabilities.
+
+          The first is fetching a URL: `ADD https://example.com/x.tar.gz
+          /x/` downloads the file during the build. The download is not
+          part of the build context, so it is not hashed into the layer's
+          cache key, and it is fetched again on any build that is not
+          cached. Two builds of the same Dockerfile can produce different
+          images, and neither of them is wrong -- which is the worst
+          possible property for an artefact.
+
+          The second is unpacking a local tar archive. An archive is
+          trusted input that Docker expands into the image without
+          looking at it, and an archive that happens to contain a
+          `Dockerfile` can overwrite the one being built. Docker's own
+          documentation warns about this.
+
+          `COPY` does one thing: it copies files from the build context.
+          It is explicit, it is hashed, and it is what you want in almost
+          every Dockerfile. `ADD` earns its keep only when you really do
+          want a URL or an archive, and even then it is usually clearer to
+          fetch the file yourself and copy it in.
+        tags: [files, dockerfile]
+      - id: f-dockerignore
+        title: Keep a file out of the build context
+        prompt: |
+          The build context holds two files: `app.txt`, which belongs in
+          the image, and `secrets.txt`, which must never leave your
+          machine.
+
+          Copy the whole context into `/app`, and add a `.dockerignore` in
+          the context root that keeps `secrets.txt` out of it.
+
+          The image must contain `app.txt` and must not contain
+          `secrets.txt`. A file excluded by `.dockerignore` is not in the
+          context at all, so `COPY` cannot reach it -- not even by name.
+        kind: image
+        entry_file: Dockerfile
+        files:
+          secrets.txt: |
+            the secret value
+          app.txt: |
+            the application
+          .dockerignore: |
+            # One pattern per line. Files matched here are not sent to the
+            # daemon at all.
+          Dockerfile: |
+            FROM alpine:3.20
+
+            COPY . /app
+
+            CMD ["ls", "/app"]
+        solution:
+          secrets.txt: |
+            the secret value
+          app.txt: |
+            the application
+          .dockerignore: |
+            secrets.txt
+          Dockerfile: |
+            FROM alpine:3.20
+
+            COPY . /app
+
+            CMD ["ls", "/app"]
+        checks:
+          - name: the secret is not in the image
+            kind: run
+            command: test ! -e /app/secrets.txt
+          - name: the application is in the image
+            kind: run
+            command: test -f /app/app.txt
+          - name: running the image lists the context
+            kind: default
+        cases:
+          - name: the default run
+        hints:
+          - "A `.dockerignore` in the context root lists the patterns that must not be sent to the daemon."
+          - "One pattern per line; the name of the file on its own is enough to exclude it."
+          - "The file has to exist before the build -- a `.dockerignore` that is not in the context root does nothing."
+        teach: |
+          A build context is uploaded to the daemon in full, before the
+          build starts. `.dockerignore` is the file that decides what is in
+          it.
+
+          The patterns are matched against paths relative to the context
+          root. A bare name matches that path and nothing deeper --
+          `notes.txt` excludes `./notes.txt` but not `./sub/notes.txt`. A
+          trailing slash matches a directory and everything under it, `*`
+          matches within one path segment, and `**` crosses directory
+          boundaries, so `**/notes.txt` excludes the file at any depth.
+
+          `secrets.txt` excludes that file; `secrets/` excludes the whole
+          directory; `*.log` excludes every log file.
+
+          The effect is not only about what ends up in the image. A file
+          excluded by `.dockerignore` is never uploaded, so it never
+          leaves the machine. That is the difference between "not in the
+          image" and "not on the daemon" -- and for a credential, only the
+          second one is worth anything.
+
+          It is also the difference between a fast build and a slow one.
+          A context that carries `node_modules`, a `.git` directory and a
+          build cache is uploaded in full on every cold build, and Docker
+          has to hash all of it to work out what changed.
+
+          Note that excluding a file makes it unreachable. `COPY` of an
+          excluded file does not quietly fall back to something else: the
+          build warns that the file is excluded and then stops with "not
+          found", because there is no such file in the context to find.
+        tags: [files, security]
+      - id: f-context-root
+        title: The context root, not the Dockerfile's directory
+        prompt: |
+          This exercise's Dockerfile lives in `app/Dockerfile`, but the
+          build context is the project root -- the directory the build is
+          run from, one level up.
+
+          Copy the file `notes.txt`, which lives in the project root, into
+          the image at `/app/notes.txt`, and print it when the container
+          runs.
+
+          The source path in a `COPY` is resolved against the context root,
+          not against the directory the Dockerfile is in.
+        kind: image
+        entry_file: app/Dockerfile
+        files:
+          notes.txt: |
+            the release notes
+          app/Dockerfile: |
+            FROM alpine:3.20
+
+            # Copy notes.txt from the context root into /app/notes.txt,
+            # and print it when the container runs.
+        solution:
+          notes.txt: |
+            the release notes
+          app/Dockerfile: |
+            FROM alpine:3.20
+
+            COPY notes.txt /app/notes.txt
+
+            CMD ["cat", "/app/notes.txt"]
+        checks:
+          - name: the file is in the image
+            kind: run
+            command: cat /app/notes.txt
+          - name: running the image prints the contents
+            kind: default
+        cases:
+          - name: the default run
+        hints:
+          - "The build context is the project root, so `notes.txt` is at the top level of the context."
+          - "`COPY notes.txt /app/notes.txt` is right; `COPY app/notes.txt ...` asks for a file that is not in the context."
+          - "Leave `notes.txt` as it is; the check compares what ends up in the image with the file you were given."
+        teach: |
+          There are two paths in a `COPY` and they live in different
+          places. The source is a path in the build context; the
+          destination is a path in the image. Neither has anything to do
+          with where the Dockerfile is.
+
+          That is worth internalising because the Dockerfile's own
+          directory is the most natural guess and it is wrong. With
+
+          ```
+          project/
+            Dockerfile
+            notes.txt
+          ```
+
+          and a build run from `project`, the source is `notes.txt`. Add
+          `project/app/Dockerfile` and build it with
+          `docker build -f app/Dockerfile .`, and the context is still
+          `project` -- so the source is still `notes.txt`, not
+          `app/notes.txt`.
+
+          The error when you get it wrong is unusually clear: the build
+          stops with "not found" naming the path it looked for, and it
+          names the *context* it searched. If a `COPY` cannot find its
+          source, the first thing to check is where the build was run
+          from.
+
+          This is also why the build command's last argument matters so
+          much. `docker build -f app/Dockerfile .` and
+          `docker build -f app/Dockerfile app` are different builds with
+          different contexts, and the second one cannot see `notes.txt` at
+          all.
+        tags: [files, dockerfile]

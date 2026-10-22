@@ -1,0 +1,221 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Docker Trainer</title>
+<link rel="stylesheet" href="/css/app.css">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><text y='26' font-size='26'>🐳</text></svg>">
+</head>
+<body>
+<header data-nav></header>
+
+<main class="wrap">
+  <div style="margin:44px 0 8px">
+    <h1>Learn Docker by shipping containers.</h1>
+    <p style="color:var(--text-muted);max-width:62ch;font-size:1.05rem">
+      Three tracks of lessons and graded exercises, from your first
+      <code>FROM</code> to multi-stage builds, BuildKit cache mounts and
+      reproducible images. Every exercise is <strong>really built</strong>,
+      and every answer is checked against a reference solution — not against
+      a lookup table.
+    </p>
+    <div class="row" style="margin-top:20px">
+      <a class="btn btn-primary" href="/learn.html" id="start-link">Start learning</a>
+      <a class="btn" href="/practice.html">Browse exercises</a>
+      <a class="btn" href="/playground.html">Free playground</a>
+    </div>
+    <div id="docker-status"></div>
+  </div>
+
+  <div class="section-head"><h2>Your progress</h2><span class="sub" id="progress-link"></span></div>
+  <div class="stats" id="stats"></div>
+
+  <div class="section-head">
+    <h2>Tracks</h2>
+    <span class="sub">Pick a level, or skip around freely.</span>
+  </div>
+  <div class="grid grid-3" id="tracks"></div>
+
+  <div id="review-cta"></div>
+
+  <footer data-footer></footer>
+</main>
+
+<script type="module">
+import { api } from '/js/api.js';
+import { mountNav, mountFooter, loading, failure } from '/js/layout.js';
+import { el, mount, statusBadge } from '/js/dom.js';
+
+mountNav();
+mountFooter();
+
+const tracksNode = document.getElementById('tracks');
+const statsNode = document.getElementById('stats');
+
+loading(tracksNode, 'Loading the curriculum...');
+
+try {
+  const data = await api.curriculum();
+  const { summary, tracks } = data;
+
+  // Point "Start" at whatever is actually next rather than always at page 1.
+  const next = findNext(tracks);
+  const startLink = document.getElementById('start-link');
+  startLink.href = next || '/learn.html';
+  startLink.textContent = next ? 'Continue where you left off' : 'Start learning';
+
+  mount(
+    statsNode,
+    stat(summary.solved, 'Solved', 'success'),
+    stat(summary.revealed, 'Revealed', 'warning'),
+    stat(summary.attempted, 'Attempted'),
+    stat(summary.unsolved, 'Not started'),
+    stat(`${Math.round(summary.solve_rate * 100)}%`, 'Solve rate'),
+  );
+
+  const sub = document.getElementById('progress-link');
+  if (summary.total) {
+    sub.append(el('a', { href: '/progress.html', text: 'See detail' }));
+  }
+
+  mount(tracksNode, tracks.map(renderTrack));
+
+  renderReviewCta();
+} catch (error) {
+  failure(tracksNode, error);
+}
+
+/** Say plainly whether the daemon is reachable.
+ *
+ *  The lessons and the exercise text work without Docker. Only building
+ *  does not, and a learner who finds that out at the first submission is
+ *  having a bad time for no reason.
+ */
+async function renderDockerStatus() {
+  const node = document.getElementById('docker-status');
+  let health;
+  try {
+    health = await fetch('/api/health').then((r) => r.json());
+  } catch {
+    return;
+  }
+  const docker = health.docker;
+  if (!docker) return;
+
+  if (!docker.available) {
+    node.append(
+      el('div', { class: 'banner warn', style: 'margin-top:18px' }, [
+        el('span', { class: 'kind', text: 'docker' }),
+        'The Docker daemon is not reachable, so exercises cannot be built. The lessons still work.',
+      ]),
+    );
+    return;
+  }
+
+  node.append(
+    el('div', { class: 'result-meta', style: 'margin-top:14px' }, [
+      el('span', { text: `Docker ${docker.version}` }),
+      el('span', { class: 'spacer' }),
+      el('span', { text: `${health.exercises} exercises · ${health.checks} checks` }),
+    ]),
+  );
+}
+
+/** Surface the review queue on the home page.
+ *
+ *  A spaced-repetition schedule that you have to go looking for is a schedule
+ *  you will not act on, so the count lives where every session starts.
+ */
+async function renderReviewCta() {
+  const node = document.getElementById('review-cta');
+  let review;
+  try {
+    review = await api.review();
+  } catch {
+    return; // A missing review panel must never break the home page.
+  }
+
+  const { counts } = review;
+  if (counts.due_now > 0) {
+    node.append(
+      el('div', { class: 'card', style: 'margin-top:36px;display:flex;gap:16px;align-items:center;flex-wrap:wrap;border-color:#4a3a1c;background:#2a2113' }, [
+        el('div', { style: 'flex:1;min-width:240px' }, [
+          el('div', { style: 'font-weight:600' },
+            `${counts.due_now} exercise${counts.due_now === 1 ? '' : 's'} due for review`),
+          el('div', { style: 'color:var(--text-muted);font-size:.875rem;margin-top:2px' },
+            'Spaced repetition: what you solved earlier is coming back before you lose it.'),
+        ]),
+        el('a', { class: 'btn btn-primary', href: '/review.html' }, 'Review now'),
+      ]),
+    );
+  } else if (counts.scheduled > 0) {
+    node.append(
+      el('div', { class: 'card', style: 'margin-top:36px;display:flex;gap:16px;align-items:center;flex-wrap:wrap' }, [
+        el('div', { style: 'flex:1;min-width:240px' }, [
+          el('div', { style: 'font-weight:600' }, 'Nothing due for review'),
+          el('div', { style: 'color:var(--text-muted);font-size:.875rem;margin-top:2px' },
+            nextReviewText(counts)),
+        ]),
+        el('a', { class: 'btn', href: '/review.html' }, 'See schedule'),
+      ]),
+    );
+  }
+}
+
+function nextReviewText(counts) {
+  if (!counts.next_due_at) return 'Nothing scheduled yet.';
+  const days = counts.next_due_in_days;
+  const when = days < 1
+    ? `in ${Math.max(1, Math.round(days * 24))} hours`
+    : `in ${Math.round(days)} day${Math.round(days) === 1 ? '' : 's'}`;
+  return `${counts.scheduled} exercise${counts.scheduled === 1 ? '' : 's'} in your schedule, next ${when}.`;
+}
+
+function stat(value, label, cls = '') {
+  return el('div', { class: `stat ${cls}`.trim() }, [
+    el('div', { class: 'value', text: String(value) }),
+    el('div', { class: 'label', text: label }),
+  ]);
+}
+
+function renderTrack(track) {
+  const done = track.lessons.reduce(
+    (total, lesson) =>
+      total + lesson.exercises.filter((ex) => ex.status === 'solved').length,
+    0,
+  );
+
+  return el('a', { class: 'card', href: `/learn.html?track=${encodeURIComponent(track.id)}`, style: 'color:inherit' }, [
+    el('div', { class: 'row', style: 'margin-bottom:10px' }, [
+      el('span', { class: `badge ${track.difficulty}`, text: track.difficulty }),
+      el('span', { class: 'sub', style: 'color:var(--text-faint);font-size:.8rem' }, [
+        `${track.exercise_count} exercises`,
+      ]),
+    ]),
+    el('h3', { style: 'margin:0 0 6px' }, track.title),
+    el('p', { style: 'color:var(--text-muted);font-size:.875rem;margin:0 0 14px' }, track.description),
+    el('div', { class: 'result-meta', style: 'margin:0' }, [
+      el('span', { text: done === track.exercise_count ? 'Complete' : `${done} / ${track.exercise_count} solved` }),
+    ]),
+  ]);
+}
+
+/** The first exercise in curriculum order that is not yet solved. */
+function findNext(tracks) {
+  for (const track of tracks) {
+    for (const lesson of track.lessons) {
+      for (const exercise of lesson.exercises) {
+        if (exercise.status !== 'solved') {
+          return `/exercise.html?id=${encodeURIComponent(exercise.id)}`;
+        }
+      }
+    }
+  }
+  return null;
+}
+
+renderDockerStatus();
+</script>
+</body>
+</html>

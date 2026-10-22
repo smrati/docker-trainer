@@ -1,0 +1,220 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Review · Docker Trainer</title>
+<link rel="stylesheet" href="/css/app.css">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><text y='26' font-size='26'>🐳</text></svg>">
+</head>
+<body>
+<header data-nav></header>
+
+<main class="wrap">
+  <div class="section-head" style="margin-top:32px">
+    <h1 style="margin:0">Review</h1>
+    <span class="sub">Exercises return on a widening schedule. Forgetting one brings it straight back.</span>
+  </div>
+
+  <div id="summary">
+    <div class="empty"><span class="spinner"></span> Loading your schedule...</div>
+  </div>
+
+  <div class="section-head">
+    <h2>Concepts</h2>
+    <span class="sub">Ranked by how much is due, then by how often you pass them.</span>
+  </div>
+  <div class="grid grid-3" id="concepts"></div>
+
+  <div class="section-head">
+    <h2>Queue</h2>
+    <span class="sub" id="queue-sub"></span>
+  </div>
+  <div id="queue"></div>
+
+  <footer data-footer></footer>
+</main>
+
+<script type="module">
+import { api } from '/js/api.js';
+import { mountNav, mountFooter, loading, failure } from '/js/layout.js';
+import { el, mount, $ } from '/js/dom.js';
+
+mountNav();
+mountFooter();
+
+const summaryNode = $('#summary');
+const conceptsNode = $('#concepts');
+const queueNode = $('#queue');
+
+let data = null;
+let conceptFilter = null;
+
+loading(summaryNode, 'Loading your schedule...');
+load();
+
+async function load() {
+  try {
+    data = await api.review();
+  } catch (error) {
+    failure(summaryNode, error);
+    return;
+  }
+  renderSummary();
+  renderConcepts();
+  renderQueue();
+}
+
+function renderSummary() {
+  const { counts } = data;
+  const stats = [
+    stat(counts.due_now, 'Due now', counts.due_now ? 'warning' : ''),
+    stat(counts.due_soon, 'Due within a day'),
+    stat(counts.scheduled, 'In the schedule'),
+    stat(counts.reviews_logged, 'Reviews logged'),
+    stat(counts.solved, 'Solved'),
+  ];
+
+  const children = [el('div', { class: 'stats' }, stats)];
+
+  if (counts.due_now > 0) {
+    children.push(
+      el('div', { class: 'card', style: 'margin-top:16px;display:flex;gap:16px;align-items:center;flex-wrap:wrap' }, [
+        el('div', { style: 'flex:1;min-width:240px' }, [
+          el('div', { style: 'font-weight:600;margin-bottom:3px' },
+            `${counts.due_now} exercise${counts.due_now === 1 ? '' : 's'} ready for review`),
+          el('div', { style: 'color:var(--text-muted);font-size:.875rem' },
+            'Answer from memory. Passing widens the gap to next time; failing brings it straight back.'),
+        ]),
+        el('a', {
+          class: 'btn btn-primary',
+          href: `/exercise.html?id=${encodeURIComponent(data.due[0].exercise_id)}`,
+        }, 'Start review'),
+      ]),
+    );
+  } else if (counts.scheduled > 0) {
+    children.push(
+      el('div', { class: 'banner', style: 'margin-top:16px' }, [
+        'Nothing due. Next review ',
+        el('strong', {}, when(counts.next_due_in_days)),
+        counts.next_due_at ? ` (${counts.next_due_at.slice(0, 10)})` : '',
+        '.',
+      ]),
+    );
+  } else {
+    children.push(
+      el('div', { class: 'banner', style: 'margin-top:16px' },
+        'Nothing scheduled yet. Solve an exercise without revealing its solution and it will appear here.'),
+    );
+  }
+
+  mount(summaryNode, children);
+}
+
+function stat(value, label, cls = '') {
+  return el('div', { class: `stat ${cls}`.trim() }, [
+    el('div', { class: 'value', text: String(value) }),
+    el('div', { class: 'label', text: label }),
+  ]);
+}
+
+const STATE_META = {
+  due: ['Due now', 'warning'],
+  weak: ['Weak', 'warning'],
+  learning: ['Learning', ''],
+  strong: ['Strong', 'solved'],
+  untouched: ['Not started', ''],
+};
+
+function renderConcepts() {
+  mount(conceptsNode, data.concepts.map(renderConcept));
+}
+
+function renderConcept(concept) {
+  const [label, cls] = STATE_META[concept.state] || STATE_META.untouched;
+  const selected = conceptFilter === concept.tag;
+
+  const card = el('div', {
+    class: 'card',
+    style: `cursor:pointer;${selected ? 'border-color:var(--accent)' : ''}`,
+    onclick: () => {
+      conceptFilter = selected ? null : concept.tag;
+      renderConcepts();
+      renderQueue();
+    },
+  }, [
+    el('div', { class: 'row', style: 'margin-bottom:6px' }, [
+      el('strong', { style: 'font-size:.95rem' }, concept.label),
+      el('span', { class: 'spacer' }),
+      concept.due_now
+        ? el('span', { class: 'badge warning', text: `${concept.due_now} due` })
+        : el('span', { class: `badge ${cls}`.trim(), text: label }),
+    ]),
+    el('div', { style: 'color:var(--text-muted);font-size:.8125rem;min-height:2.4em' }, concept.description),
+    el('div', { class: 'row', style: 'margin-top:8px;font-size:.8125rem;color:var(--text-faint)' }, [
+      el('span', {}, `${concept.solved}/${concept.total} solved`),
+      el('span', { class: 'spacer' }),
+      concept.accuracy !== null
+        ? el('span', {}, `${Math.round(concept.accuracy * 100)}% pass rate`)
+        : el('span', {}, 'no reviews'),
+    ]),
+  ]);
+  return card;
+}
+
+function renderQueue() {
+  const rows = conceptFilter ? data.due.filter((d) => d.tags.includes(conceptFilter)) : data.due;
+  const sub = $('#queue-sub');
+
+  sub.replaceChildren();
+  if (conceptFilter) {
+    const concept = data.concepts.find((c) => c.tag === conceptFilter);
+    sub.append(
+      el('button', { class: 'btn-sm btn-ghost', onclick: () => {
+        conceptFilter = null;
+        renderConcepts();
+        renderQueue();
+      } }, `Filtering by ${concept ? concept.label : conceptFilter} ✕`),
+    );
+  } else {
+    sub.append(document.createTextNode('Most overdue first.'));
+  }
+
+  if (!rows.length) {
+    mount(queueNode, el('div', { class: 'empty' },
+      conceptFilter
+        ? 'Nothing due for this concept right now.'
+        : 'Nothing due. Nice work — come back when the schedule says so.'));
+    return;
+  }
+
+  mount(queueNode, rows.map((entry) =>
+    el('a', { class: 'ex-row', href: `/exercise.html?id=${encodeURIComponent(entry.exercise_id)}` }, [
+      el('span', { class: 'title' }, entry.title),
+      el('span', { class: 'meta' }, [
+        el('span', { class: 'badge ' + entry.difficulty, text: entry.difficulty }),
+        el('span', {}, overdueText(entry.days_overdue)),
+        entry.lapses
+          ? el('span', { style: 'color:var(--warning)' }, `${entry.lapses} lapse${entry.lapses === 1 ? '' : 's'}`)
+          : null,
+        el('span', { style: 'color:var(--text-faint)' }, `${entry.reps} passed`),
+      ]),
+    ]),
+  ));
+}
+
+function overdueText(days) {
+  if (days >= 1) return `${Math.round(days)}d overdue`;
+  if (days > 0) return `${Math.round(days * 24)}h overdue`;
+  if (days === 0) return 'due now';
+  return `due in ${Math.max(1, Math.round(-days))}d`;
+}
+
+function when(days) {
+  if (days === null || days === undefined) return 'shortly';
+  if (days < 1) return `in ${Math.max(1, Math.round(days * 24))} hours`;
+  return `in ${Math.round(days)} day${Math.round(days) === 1 ? '' : 's'}`;
+}
+</script>
+</body>
+</html>

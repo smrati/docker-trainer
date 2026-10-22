@@ -1,0 +1,127 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Practise · Docker Trainer</title>
+<link rel="stylesheet" href="/css/app.css">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><text y='26' font-size='26'>🐳</text></svg>">
+</head>
+<body>
+<header data-nav></header>
+
+<main class="wrap">
+  <div class="section-head" style="margin-top:32px">
+    <h1 style="margin:0">Practise</h1>
+    <span class="sub" id="count"></span>
+  </div>
+
+  <div class="filters">
+    <input id="search" type="search" placeholder="Search exercises…" autocomplete="off">
+    <select id="track">
+      <option value="">All tracks</option>
+    </select>
+    <select id="status">
+      <option value="">Any status</option>
+      <option value="unsolved">Not started</option>
+      <option value="solved">Solved</option>
+      <option value="revealed">Revealed</option>
+    </select>
+    <span class="spacer"></span>
+    <button class="btn-sm" id="hide-solved" type="button">Hide solved</button>
+  </div>
+
+  <div id="list">
+    <div class="empty"><span class="spinner"></span> Loading exercises...</div>
+  </div>
+
+  <footer data-footer></footer>
+</main>
+
+<script type="module">
+import { api } from '/js/api.js';
+import { mountNav, mountFooter, loading, failure } from '/js/layout.js';
+import { el, mount, statusBadge } from '/js/dom.js';
+
+mountNav();
+mountFooter();
+
+const list = document.getElementById('list');
+const search = document.getElementById('search');
+const trackSelect = document.getElementById('track');
+const statusSelect = document.getElementById('status');
+const hideSolved = document.getElementById('hide-solved');
+const countNode = document.getElementById('count');
+
+let rows = [];
+let hideSolvedOn = false;
+
+loading(list, 'Loading exercises...');
+try {
+  const data = await api.curriculum();
+
+  for (const track of data.tracks) {
+    trackSelect.append(el('option', { value: track.id }, track.title));
+  }
+
+  rows = data.tracks.flatMap((track) =>
+    track.lessons.flatMap((lesson) =>
+      lesson.exercises.map((exercise) => ({
+        ...exercise,
+        trackId: track.id,
+        trackTitle: track.title,
+        difficulty: track.difficulty,
+        lessonTitle: lesson.title,
+      })),
+    ),
+  );
+
+  for (const node of [search, trackSelect, statusSelect]) {
+    node.addEventListener('input', render);
+    node.addEventListener('change', render);
+  }
+  hideSolved.addEventListener('click', () => {
+    hideSolvedOn = !hideSolvedOn;
+    hideSolved.classList.toggle('active', hideSolvedOn);
+    hideSolved.textContent = hideSolvedOn ? 'Showing unsolved' : 'Hide solved';
+    render();
+  });
+
+  render();
+} catch (error) {
+  failure(list, error);
+}
+
+function render() {
+  const needle = search.value.trim().toLowerCase();
+  const visible = rows.filter((row) => {
+    if (trackSelect.value && row.trackId !== trackSelect.value) return false;
+    if (statusSelect.value && row.status !== statusSelect.value) return false;
+    if (hideSolvedOn && row.status === 'solved') return false;
+    if (needle && !`${row.title} ${row.lessonTitle}`.toLowerCase().includes(needle)) return false;
+    return true;
+  });
+
+  countNode.textContent = visible.length === rows.length
+    ? `${rows.length} exercises`
+    : `${visible.length} of ${rows.length}`;
+
+  if (!visible.length) {
+    mount(list, el('div', { class: 'empty' }, 'No exercises match those filters.'));
+    return;
+  }
+
+  mount(list, visible.map((row) =>
+    el('a', { class: 'ex-row', href: `/exercise.html?id=${encodeURIComponent(row.id)}` }, [
+      el('span', { class: 'title' }, row.title),
+      el('span', { class: 'meta' }, [
+        el('span', { style: 'color:var(--text-faint)' }, `${row.trackTitle} · ${row.lessonTitle}`),
+        row.attempts ? el('span', {}, `${row.attempts} attempt${row.attempts === 1 ? '' : 's'}`) : null,
+        statusBadge(row.status),
+      ]),
+    ]),
+  ));
+}
+</script>
+</body>
+</html>

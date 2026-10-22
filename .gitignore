@@ -1,0 +1,17 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# The local progress database. It is yours, not the project's.
+data/
+*.db
+
+# Browser-check screenshots
+shots/

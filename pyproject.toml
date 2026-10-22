@@ -1,0 +1,63 @@
+[project]
+name = "docker-trainer"
+version = "0.1.0"
+description = "Learn, practise and get assessed on Docker."
+readme = "README.md"
+requires-python = ">=3.14"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+dependencies = [
+    "fastapi>=0.143.3",
+    "pyyaml>=6.0.3",
+    "uvicorn[standard]>=0.54.0",
+]
+
+[dependency-groups]
+dev = [
+    "httpx2>=2.13.1",
+    "pytest>=9.1.1",
+    "ruff>=0.17.1",
+    "websockets>=17.3",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py314"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "PL", "PIE", "FURB", "BLE"]
+ignore = [
+    # FastAPI's dependency-injection style puts calls in defaults by design:
+    #   def route(..., curriculum: Curriculum = Depends(get_curriculum))
+    "B008",
+    # Endpoints deliberately catch broad exceptions to turn them into a
+    # user-facing message rather than a 500; EngineError carries the detail.
+    "BLE001",
+    # Grading and schema rendering are inherently branchy: each returns a
+    # specific message per failure mode, which is the point.
+    "PLR0911",
+    "PLR0912",
+    "PLR0913",
+    # Type dispatch reads best as a chain of `if tag == ...` checks.
+    "PLR1714",
+    # Deliberate local imports avoid a circular import between routers and
+    # the modules they call into.
+    "PLC0415",
+]
+
+[tool.ruff.lint.per-file-ignores]
+# Test helpers call subprocess.run to check JS syntax and assert on concrete
+# row/column counts; naming those constants would obscure the assertion.
+"tests/*" = ["PLW1510", "PLR2004", "PLR0913", "E501"]
+# The browser scripts embed JavaScript as string literals and assert on literal
+# UI values (5 rows, 2 hints). Wrapping either would hurt clarity.
+"scripts/browser_*.py" = ["E501", "PLR2004"]
+# The engine shells out to the docker CLI with fixed argv and no shell.
+"app/engine/cli.py" = ["S603", "S607"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+markers = [
+    "slow: needs a Docker daemon, and takes seconds rather than milliseconds",
+]
