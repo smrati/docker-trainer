@@ -84,11 +84,12 @@ p { margin: 0 0 1em; }
 }
 .brand:hover { text-decoration: none; }
 .brand .logo {
-  width: 22px; height: 22px;
-  border-radius: 5px;
+  width: 26px; height: 26px;
+  border-radius: 6px;
   background: linear-gradient(135deg, var(--accent), #8f6bff);
   display: grid;
   place-items: center;
+  color: #0f1115;
   font-size: 11px;
   font-weight: 700;
   color: #fff;

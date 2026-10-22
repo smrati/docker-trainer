@@ -12,6 +12,20 @@ const LINKS = [
   ['/progress.html', 'Progress'],
 ];
 
+/** The mark: three shipping containers, stacked.
+ *
+ *  An SVG rather than an emoji, because an emoji is a font glyph: on a
+ *  machine without an emoji font it renders as a blank box, and a logo
+ *  that is a blank box is not a logo.
+ */
+const LOGO = `<svg viewBox="0 0 32 32" width="19" height="19" fill="none"
+  stroke="currentColor" stroke-width="2.4" stroke-linejoin="round"
+  aria-hidden="true" focusable="false">
+  <rect x="3" y="17" width="12" height="12" rx="1.5"/>
+  <rect x="17" y="17" width="12" height="12" rx="1.5"/>
+  <rect x="10" y="3" width="12" height="12" rx="1.5"/>
+</svg>`;
+
 export function mountNav() {
   const header = document.querySelector('[data-nav]');
   if (!header) return;
@@ -20,7 +34,7 @@ export function mountNav() {
   header.append(
     el('div', { class: 'topbar-inner' }, [
       el('a', { class: 'brand', href: '/' }, [
-        el('span', { class: 'logo', text: '🐳' }),
+        el('span', { class: 'logo', html: LOGO }),
         'Docker Trainer',
       ]),
       el(

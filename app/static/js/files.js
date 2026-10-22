@@ -28,7 +28,9 @@ export function fileEditor(container, files, { onChange } = {}) {
     autocorrect: 'off',
   });
   const bar = el('div', { class: 'editor-bar' });
-  const shell = el('div', { class: 'editor-shell' }, [bar, textarea]);
+  // The tabs sit between the bar and the textarea: they label what is
+  // being edited, so they belong directly above it.
+  const shell = el('div', { class: 'editor-shell' }, [bar, tabs, textarea]);
 
   container.append(shell);
 
@@ -120,7 +122,6 @@ export function fileEditor(container, files, { onChange } = {}) {
 
   renderTabs();
   if (active) textarea.value = contents.get(active) || '';
-  shell.append(tabs);
 
   return { getFiles, setFiles, focus, activeName: () => active, element: shell };
 }
