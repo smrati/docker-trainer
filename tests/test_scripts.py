@@ -152,10 +152,74 @@ class TestPruneScript:
         assert callable(image_engine.disk_usage)
 
 
+class TestServeScript:
+    """The start script has to find a free port, or it is no use."""
+
+    serve = _load("serve")
+
+    def test_a_free_port_is_found(self):
+        port, taken = self.serve.find_port(0)
+        assert port is not None
+        assert not taken
+
+    def test_a_busy_port_is_skipped(self):
+        """The whole point of the script."""
+        import socket
+
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            sock.bind(("127.0.0.1", 0))
+            sock.listen(1)
+            busy = sock.getsockname()[1]
+
+            port, taken = self.serve.find_port(busy)
+            assert port == busy + 1
+            assert busy in taken
+
+    def test_several_busy_ports_are_skipped(self):
+        import socket
+
+        ports = []
+        socks = []
+        for _ in range(3):
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            sock.bind(("127.0.0.1", 0))
+            sock.listen(1)
+            socks.append(sock)
+            ports.append(sock.getsockname()[1])
+
+        try:
+            # The three sockets are on consecutive-ish ports, so the search
+            # must step over them rather than stopping at the first.
+            first = min(ports)
+            port, taken = self.serve.find_port(first)
+            assert port > first
+            assert first in taken
+        finally:
+            for sock in socks:
+                sock.close()
+
+    def test_a_busy_host_address_is_not_free(self):
+        import socket
+
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            sock.bind(("127.0.0.1", 0))
+            sock.listen(1)
+            port = sock.getsockname()[1]
+            assert self.serve.is_free(port, "127.0.0.1") is False
+
+    def test_the_wildcard_address_is_not_shown_as_a_url(self):
+        """0.0.0.0 is the address to bind, not one to visit."""
+        assert self.serve._display_host("0.0.0.0") == "127.0.0.1"
+        assert self.serve._display_host("127.0.0.1") == "127.0.0.1"
+
+
 @pytest.mark.parametrize(
     "name",
     ["lint_content.py", "fix_quoting.py", "fix_indentation.py", "tag_exercises.py",
-     "prune_images.py", "smoke.py", "browser_check.py", "browser_flow.py"],
+     "prune_images.py", "smoke.py", "browser_check.py", "browser_flow.py", "serve.py"],
 )
 def test_every_script_has_a_docstring(name):
     """A script nobody can read is a script nobody will trust."""

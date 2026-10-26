@@ -13,11 +13,33 @@ multi-stage builds, BuildKit cache mounts and reproducible images.
 ## Quick start
 
 ```bash
-uv sync
-uv run uvicorn app.main:app --reload
+./start.sh
 ```
 
 Then open <http://127.0.0.1:8000>.
+
+`start.sh` finds a free port for you: it starts at 8000 and moves up until
+one is free, so it does not matter whether something else has taken 8000.
+It prints the URL it settled on.
+
+```bash
+./start.sh --port 9000       # start looking from 9000
+./start.sh --reload          # restart on a code change
+./start.sh --host 0.0.0.0    # reachable from your phone
+```
+
+`PORT` and `HOST` are read from the environment if you would rather set
+them there.
+
+The plain uvicorn command works too, if you would rather not have the
+script in the way:
+
+```bash
+uv run uvicorn app.main:app --reload --port 9000
+```
+
+`start.sh` runs `uv` for you and creates the environment on first run, so
+a fresh clone needs nothing but that one command.
 
 **Docker has to be installed and running.** The exercises are really built
 and really run, so there is no daemon, no exercises. The lessons and the
